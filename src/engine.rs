@@ -167,7 +167,7 @@ impl Runner {
                 desktop.validate(&Point {
                     x,
                     y,
-                    interval_ms: None,
+                    interval_ticks: None,
                 })?;
             }
         }
@@ -329,7 +329,7 @@ impl Runner {
                                 _ => Point {
                                     x: 0,
                                     y: 0,
-                                    interval_ms: None,
+                                    interval_ticks: None,
                                 },
                             };
                             let sent_at = Instant::now();
@@ -373,10 +373,10 @@ impl Runner {
                             let interval = if settings.mode == ClickMode::Recorded {
                                 settings.interval_for(index as usize)
                             } else {
-                                settings.fast_interval_ms
+                                settings.fast_interval_ticks
                             };
                             index = if last { 0 } else { index + 1 };
-                            if !waiter.until(sent_at + Duration::from_millis(interval))? {
+                            if !waiter.until(sent_at + Duration::from_nanos(interval * 100))? {
                                 break 'outer;
                             }
                         }
@@ -500,7 +500,7 @@ impl Desktop {
         self.validate(&Point {
             x: point.x,
             y: point.y,
-            interval_ms: None,
+            interval_ticks: None,
         })?;
         // Button events carry no MOVE/ABSOLUTE flag: user motion remains untouched.
         let events = pointer_inputs(right);
@@ -626,7 +626,7 @@ fn normalize(value: i32, origin: i32, size: i32) -> i32 {
 
 #[derive(Debug, Serialize)]
 pub struct BenchmarkReport {
-    pub requested_interval_ms: u64,
+    pub requested_interval_ticks: u64,
     pub intervals: usize,
     pub high_resolution: bool,
     pub elapsed_ms: f64,
@@ -635,8 +635,12 @@ pub struct BenchmarkReport {
     pub p95_ms: f64,
     pub max_ms: f64,
 }
-pub fn benchmark(interval_ms: u64, count: usize) -> Result<BenchmarkReport, ClickerError> {
-    if interval_ms == 0 || interval_ms > 3_600_000 || count == 0 || count > 10_000 {
+pub fn benchmark(interval_ticks: u64, count: usize) -> Result<BenchmarkReport, ClickerError> {
+    if !(crate::model::MIN_INTERVAL_TICKS..=crate::model::MAX_INTERVAL_TICKS)
+        .contains(&interval_ticks)
+        || count == 0
+        || count > 10_000
+    {
         return Err(ErrorCode::BenchmarkRange.into());
     }
     let waiter = Waiter::new(Arc::new(Signal::new()?))?;
@@ -644,7 +648,7 @@ pub fn benchmark(interval_ms: u64, count: usize) -> Result<BenchmarkReport, Clic
     let mut previous = start;
     let mut measurements = Vec::with_capacity(count);
     for _ in 0..count {
-        waiter.until(previous + Duration::from_millis(interval_ms))?;
+        waiter.until(previous + Duration::from_nanos(interval_ticks * 100))?;
         let now = Instant::now();
         measurements.push(now.duration_since(previous).as_secs_f64() * 1000.);
         previous = now;
@@ -653,7 +657,7 @@ pub fn benchmark(interval_ms: u64, count: usize) -> Result<BenchmarkReport, Clic
     let mean_ms = measurements.iter().sum::<f64>() / count as f64;
     measurements.sort_by(|a, b| a.total_cmp(b));
     Ok(BenchmarkReport {
-        requested_interval_ms: interval_ms,
+        requested_interval_ticks: interval_ticks,
         intervals: count,
         high_resolution: waiter.high_resolution,
         elapsed_ms,
@@ -683,7 +687,7 @@ mod tests {
                 mode: ClickMode::Area,
                 area: Some(area),
                 area_step_px: 4,
-                fast_interval_ms: 1,
+                fast_interval_ticks: 1,
                 repeat: 2,
                 ..Settings::default()
             },
@@ -714,7 +718,7 @@ mod tests {
                 mode: ClickMode::Area,
                 area: Some(a),
                 area_step_px: 1,
-                fast_interval_ms: 1,
+                fast_interval_ticks: 1,
                 repeat: 1,
                 ..Settings::default()
             },
@@ -743,7 +747,7 @@ mod tests {
             Settings {
                 mode: ClickMode::Drag,
                 repeat: 1,
-                fast_interval_ms: 1,
+                fast_interval_ticks: 1,
                 ..Settings::default()
             },
             move |_, _| {
@@ -821,17 +825,17 @@ mod tests {
             Point {
                 x: 1,
                 y: 0,
-                interval_ms: Some(1),
+                interval_ticks: Some(1),
             },
             Point {
                 x: 2,
                 y: 0,
-                interval_ms: Some(1),
+                interval_ticks: Some(1),
             },
             Point {
                 x: 3,
                 y: 0,
-                interval_ms: Some(30_000),
+                interval_ticks: Some(300_000_000),
             },
         ];
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -866,12 +870,12 @@ mod tests {
         let points = vec![Point {
             x: 0,
             y: 0,
-            interval_ms: None,
+            interval_ticks: None,
         }];
         let mut runner = Runner::with_emitter(
             Settings {
                 points,
-                interval_ms: 30_000,
+                interval_ticks: 300_000_000,
                 ..Settings::default()
             },
             move |_, _| {
@@ -897,7 +901,7 @@ mod tests {
                 points: vec![Point {
                     x: 0,
                     y: 0,
-                    interval_ms: None,
+                    interval_ticks: None,
                 }],
                 delay_ms: 30_000,
                 ..Settings::default()
@@ -922,7 +926,7 @@ mod tests {
                     points: vec![Point {
                         x: 0,
                         y: 0,
-                        interval_ms: None,
+                        interval_ticks: None,
                     }],
                     ..Settings::default()
                 },

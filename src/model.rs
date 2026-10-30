@@ -6,9 +6,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const MIN_INTERVAL_MS: u64 = 1;
-pub const MAX_INTERVAL_MS: u64 = 3_600_000;
-pub const DEFAULT_INTERVAL_MS: u64 = 501;
+pub const MIN_INTERVAL_TICKS: u64 = 1;
+pub const TICKS_PER_SECOND: u64 = 10_000_000;
+pub const TICKS_PER_MILLISECOND: u64 = 10_000;
+pub const MAX_INTERVAL_TICKS: u64 = 3600 * TICKS_PER_SECOND;
+pub const DEFAULT_INTERVAL_TICKS: u64 = 5_010_000;
 pub const MAX_POINTS: usize = 10;
 pub const ACTIONS: [&str; 4] = ["record_start", "record_stop", "click_start", "click_stop"];
 
@@ -67,7 +69,7 @@ impl ClickArea {
         Some(Point {
             x,
             y,
-            interval_ms: None,
+            interval_ticks: None,
         })
     }
 }
@@ -77,7 +79,7 @@ pub struct Point {
     pub x: i32,
     pub y: i32,
     #[serde(default)]
-    pub interval_ms: Option<u64>,
+    pub interval_ticks: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -87,7 +89,7 @@ pub struct Settings {
     pub lang: String,
     pub theme: String,
     pub points: Vec<Point>,
-    pub interval_ms: u64,
+    pub interval_ticks: u64,
     pub repeat: u32,
     pub delay_ms: u64,
     pub button: String,
@@ -98,7 +100,7 @@ pub struct Settings {
     pub mode: ClickMode,
     pub area: Option<ClickArea>,
     pub area_step_px: u32,
-    pub fast_interval_ms: u64,
+    pub fast_interval_ticks: u64,
 }
 
 #[derive(Deserialize)]
@@ -141,11 +143,11 @@ pub fn default_hotkeys() -> BTreeMap<String, String> {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            version: 2,
+            version: 3,
             lang: "ja".into(),
             theme: "system".into(),
             points: vec![],
-            interval_ms: DEFAULT_INTERVAL_MS,
+            interval_ticks: DEFAULT_INTERVAL_TICKS,
             repeat: 0,
             delay_ms: 0,
             button: "left".into(),
@@ -156,7 +158,7 @@ impl Default for Settings {
             mode: ClickMode::Recorded,
             area: None,
             area_step_px: 30,
-            fast_interval_ms: 1,
+            fast_interval_ticks: TICKS_PER_MILLISECOND,
         }
     }
 }
@@ -166,15 +168,15 @@ impl Settings {
         if self.per_point {
             self.points
                 .get(index)
-                .and_then(|p| p.interval_ms)
-                .unwrap_or(self.interval_ms)
+                .and_then(|p| p.interval_ticks)
+                .unwrap_or(self.interval_ticks)
         } else {
-            self.interval_ms
+            self.interval_ticks
         }
     }
 
     pub fn validate(&self) -> Result<(), ClickerError> {
-        if !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&self.fast_interval_ms) {
+        if !(MIN_INTERVAL_TICKS..=MAX_INTERVAL_TICKS).contains(&self.fast_interval_ticks) {
             return Err(ErrorCode::IntervalRange.into());
         }
         if !(1..=4096).contains(&self.area_step_px) {
@@ -186,7 +188,7 @@ impl Settings {
         {
             return Err(ErrorCode::AreaInvalid.into());
         }
-        if !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&self.interval_ms) {
+        if !(MIN_INTERVAL_TICKS..=MAX_INTERVAL_TICKS).contains(&self.interval_ticks) {
             return Err(ErrorCode::IntervalRange.into());
         }
         if self.points.len() > MAX_POINTS {
@@ -196,8 +198,8 @@ impl Settings {
             return Err(ErrorCode::Limits.into());
         }
         for p in &self.points {
-            if p.interval_ms
-                .is_some_and(|v| !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&v))
+            if p.interval_ticks
+                .is_some_and(|v| !(MIN_INTERVAL_TICKS..=MAX_INTERVAL_TICKS).contains(&v))
             {
                 return Err(ErrorCode::IntervalRange.into());
             }
@@ -224,12 +226,16 @@ impl Settings {
                 ));
             }
         };
-        let value: serde_json::Value = serde_json::from_slice(&raw)
+        let mut value: serde_json::Value = serde_json::from_slice(&raw)
             .map_err(|e| ClickerError::with_detail(ErrorCode::SettingsJson, e.to_string()))?;
         if !value.is_object() {
             return Err(ErrorCode::Config.into());
         }
         let migrated = value.get("version").is_none();
+        let rust_v2 = value.get("version").and_then(|v| v.as_u64()) == Some(2);
+        if rust_v2 {
+            upgrade_millisecond_settings(&mut value)?;
+        }
         let mut settings = if migrated {
             let old: LegacySettings = serde_json::from_value(value)
                 .map_err(|e| ClickerError::with_detail(ErrorCode::SettingsJson, e.to_string()))?;
@@ -246,7 +252,7 @@ impl Settings {
                     .map(|(x, y)| Point {
                         x,
                         y,
-                        interval_ms: None,
+                        interval_ticks: None,
                     })
                     .collect(),
                 repeat: old.repeat,
@@ -257,7 +263,7 @@ impl Settings {
                 ..Self::default()
             }
         } else {
-            if value.get("version").and_then(|v| v.as_u64()) != Some(2) {
+            if value.get("version").and_then(|v| v.as_u64()) != Some(3) {
                 return Err(ErrorCode::SettingsVersion.into());
             }
             serde_json::from_value(value)
@@ -267,8 +273,12 @@ impl Settings {
             settings.hotkeys.entry(key).or_insert(value);
         }
         settings.validate()?;
-        if migrated {
-            let backup = path.with_file_name("settings.python-backup.json");
+        if migrated || rust_v2 {
+            let backup = path.with_file_name(if migrated {
+                "settings.python-backup.json"
+            } else {
+                "settings.v2-backup.json"
+            });
             match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -355,38 +365,112 @@ pub fn settings_path() -> PathBuf {
         .join("settings.json")
 }
 
-/// Parse exact millisecond decimal seconds without floating point rounding.
+/// Parse exact decimal seconds in 100ns ticks, without floating point rounding.
 pub fn parse_interval(text: &str) -> Result<u64, ClickerError> {
     let text = text.trim();
     let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
     if whole.is_empty()
         || !whole.bytes().all(|b| b.is_ascii_digit())
-        || fraction.len() > 3
+        || fraction.len() > 7
         || !fraction.bytes().all(|b| b.is_ascii_digit())
     {
         return Err(ErrorCode::IntervalFormat.into());
     }
     let whole: u64 = whole.parse().map_err(|_| ErrorCode::IntervalRange)?;
-    let fraction: u64 = format!("{fraction:0<3}")
+    let fraction: u64 = format!("{fraction:0<7}")
         .parse()
         .map_err(|_| ErrorCode::IntervalFormat)?;
     let value = whole
-        .checked_mul(1000)
+        .checked_mul(TICKS_PER_SECOND)
         .and_then(|w| w.checked_add(fraction))
         .ok_or(ErrorCode::IntervalRange)?;
-    if !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&value) {
+    if !(MIN_INTERVAL_TICKS..=MAX_INTERVAL_TICKS).contains(&value) {
         return Err(ErrorCode::IntervalRange.into());
     }
     Ok(value)
 }
 
-pub fn format_interval(ms: u64) -> String {
-    format!("{}.{:03}", ms / 1000, ms % 1000)
+pub fn format_interval(ticks: u64) -> String {
+    if ticks % TICKS_PER_MILLISECOND == 0 {
+        format!(
+            "{}.{:03}",
+            ticks / TICKS_PER_SECOND,
+            (ticks % TICKS_PER_SECOND) / TICKS_PER_MILLISECOND
+        )
+    } else {
+        format!(
+            "{}.{:07}",
+            ticks / TICKS_PER_SECOND,
+            ticks % TICKS_PER_SECOND
+        )
+    }
+}
+
+fn upgrade_millisecond_settings(value: &mut serde_json::Value) -> Result<(), ClickerError> {
+    use serde_json::Value;
+    let object = value.as_object_mut().ok_or(ErrorCode::Config)?;
+    for (old, new, default_ms) in [
+        ("interval_ms", "interval_ticks", 501),
+        ("fast_interval_ms", "fast_interval_ticks", 1),
+    ] {
+        let ms = object
+            .remove(old)
+            .unwrap_or(Value::from(default_ms))
+            .as_u64()
+            .filter(|ms| (1..=3_600_000).contains(ms))
+            .ok_or(ErrorCode::IntervalRange)?;
+        object.insert(new.into(), Value::from(ms * TICKS_PER_MILLISECOND));
+    }
+    if let Some(points) = object.get_mut("points").and_then(Value::as_array_mut) {
+        for point in points {
+            let p = point.as_object_mut().ok_or(ErrorCode::PointData)?;
+            let old = p.remove("interval_ms").unwrap_or(Value::Null);
+            let ticks = if old.is_null() {
+                Value::Null
+            } else {
+                Value::from(
+                    old.as_u64()
+                        .filter(|v| (1..=3_600_000).contains(v))
+                        .ok_or(ErrorCode::IntervalRange)?
+                        * TICKS_PER_MILLISECOND,
+                )
+            };
+            p.insert("interval_ticks".into(), ticks);
+        }
+    }
+    object.insert("version".into(), Value::from(3));
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nanosecond_precision_and_millisecond_migration_preserve_exact_values() {
+        let dir = std::env::temp_dir().join(format!("clicker-tick-upgrade-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let raw=br#"{"version":2,"interval_ms":501,"fast_interval_ms":1,"points":[{"x":5,"y":-6,"interval_ms":7}],"repeat":500,"mode":"drag"}"#;
+        fs::write(&path, raw).unwrap();
+        let (mut s, _) = Settings::load(&path).unwrap();
+        assert_eq!(s.version, 3);
+        assert_eq!(s.interval_ticks, 5_010_000);
+        assert_eq!(s.fast_interval_ticks, 10_000);
+        assert_eq!(s.points[0].interval_ticks, Some(70_000));
+        assert_eq!(s.points[0].y, -6);
+        assert_eq!(s.repeat, 500);
+        assert_eq!(s.mode, ClickMode::Drag);
+        assert_eq!(fs::read(dir.join("settings.v2-backup.json")).unwrap(), raw);
+        s.fast_interval_ticks = parse_interval("0.0000001").unwrap();
+        s.points[0].interval_ticks = Some(parse_interval("0.0000009").unwrap());
+        s.save(&path).unwrap();
+        let (back, _) = Settings::load(&path).unwrap();
+        assert_eq!(back.fast_interval_ticks, 1);
+        assert_eq!(back.points[0].interval_ticks, Some(9));
+        assert_eq!(format_interval(1), "0.0000001");
+        assert_eq!(format_interval(5_010_000), "0.501");
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn grid_is_even_serpentine_and_includes_edges() {
         let a = ClickArea::from_corners((9, 8), (-2, -3));
@@ -424,10 +508,12 @@ mod tests {
     }
     #[test]
     fn old_rust_settings_default_to_recorded_and_fast_modes_round_trip() {
-        let s: Settings =
+        let mut value: serde_json::Value =
             serde_json::from_str(r#"{"version":2,"points":[],"interval_ms":501}"#).unwrap();
+        upgrade_millisecond_settings(&mut value).unwrap();
+        let s: Settings = serde_json::from_value(value).unwrap();
         assert_eq!(s.mode, ClickMode::Recorded);
-        assert_eq!(s.fast_interval_ms, 1);
+        assert_eq!(s.fast_interval_ticks, TICKS_PER_MILLISECOND);
         let area = ClickArea::from_corners((50, 60), (5, 8));
         let changed = Settings {
             mode: ClickMode::Area,
@@ -442,11 +528,13 @@ mod tests {
     #[test]
     fn decimal_boundaries_are_exact() {
         for (input, ms) in [
-            ("0.001", 1),
-            ("0.501", 501),
-            ("1", 1000),
-            ("0.01", 10),
-            ("3600.000", MAX_INTERVAL_MS),
+            ("0.0000001", 1),
+            ("0.0000009", 9),
+            ("0.001", 10_000),
+            ("0.501", 5_010_000),
+            ("1", TICKS_PER_SECOND),
+            ("0.01", 100_000),
+            ("3600.000", MAX_INTERVAL_TICKS),
         ] {
             assert_eq!(parse_interval(input).unwrap(), ms);
             assert_eq!(parse_interval(&format_interval(ms)).unwrap(), ms);
@@ -460,7 +548,7 @@ mod tests {
             "NaN",
             "inf",
             "1e-3",
-            "0.0001",
+            "0.00000001",
             "3600.001",
             "18446744073709551615",
         ] {
@@ -475,29 +563,29 @@ mod tests {
                 Point {
                     x: 0,
                     y: 0,
-                    interval_ms: Some(1),
+                    interval_ticks: Some(1),
                 },
                 Point {
                     x: 1,
                     y: 1,
-                    interval_ms: Some(7),
+                    interval_ticks: Some(7),
                 },
                 Point {
                     x: 2,
                     y: 2,
-                    interval_ms: None,
+                    interval_ticks: None,
                 },
             ],
             ..Settings::default()
         };
         assert_eq!(
             (s.interval_for(0), s.interval_for(1), s.interval_for(2)),
-            (1, 7, 501)
+            (1, 7, DEFAULT_INTERVAL_TICKS)
         );
         s.points.remove(0);
         assert_eq!(s.interval_for(0), 7);
         s.per_point = false;
-        assert_eq!(s.interval_for(0), 501);
+        assert_eq!(s.interval_for(0), DEFAULT_INTERVAL_TICKS);
     }
     #[test]
     fn migrate_preserves_positions_and_keeps_the_original() {
@@ -508,7 +596,7 @@ mod tests {
         fs::write(&path, raw).unwrap();
         let (s, migrated) = Settings::load(&path).unwrap();
         assert!(migrated);
-        assert_eq!(s.interval_ms, 501);
+        assert_eq!(s.interval_ticks, DEFAULT_INTERVAL_TICKS);
         assert_eq!(s.repeat, 500);
         assert_eq!(s.points[0].x, -150);
         s.save(&path).unwrap();
@@ -567,7 +655,7 @@ mod tests {
         readonly.set_readonly(true);
         fs::set_permissions(&path, readonly).unwrap();
         let changed = Settings {
-            interval_ms: 1,
+            interval_ticks: 1,
             ..Settings::default()
         };
         let result = changed.save(&path);

@@ -147,12 +147,12 @@ fn error_text(error: &ClickerError, japanese: bool) -> String {
             "Cannot start monitoring physical drag input.",
         ),
         IntervalRange => (
-            "間隔は 0.001〜3600.000 秒で指定してください。",
-            "Use an interval from 0.001 to 3600.000 seconds.",
+            "間隔は 0.0000001〜3600.0000000 秒で指定してください。",
+            "Use an interval from 0.0000001 to 3600.0000000 seconds.",
         ),
         IntervalFormat => (
-            "秒数は小数点以下3桁までで指定してください（例: 0.501）。",
-            "Enter seconds with up to three decimal places (for example, 0.501).",
+            "秒数は小数点以下7桁までで指定してください（例: 0.0000001）。",
+            "Enter seconds with up to seven decimal places (for example, 0.0000001).",
         ),
         PointLimit => (
             "クリック位置は10か所までです。",
@@ -499,13 +499,13 @@ impl App {
                     );
                 }
             }
-            self.settings.interval_ms = interval;
+            self.settings.interval_ticks = interval;
             self.settings.repeat = repeat;
-            self.settings.fast_interval_ms = fast;
+            self.settings.fast_interval_ticks = fast;
             self.settings.area_step_px = step;
             self.settings.area = region;
             for (p, ms) in self.settings.points.iter_mut().zip(overrides) {
-                p.interval_ms = Some(ms);
+                p.interval_ticks = Some(ms);
             }
             set_text(self.control(INTERVAL), &model::format_interval(interval));
         } else {
@@ -647,7 +647,7 @@ impl App {
         self.label(&caption, 30, 358, 240, 25);
         self.edit(
             INTERVAL,
-            &model::format_interval(self.settings.interval_ms),
+            &model::format_interval(self.settings.interval_ticks),
             320,
             353,
             160,
@@ -657,8 +657,8 @@ impl App {
         self.button(DEFAULT_INTERVAL, &reset, 490, 353, 126, 30);
         let helper = self
             .t(
-                "最小 0.001 秒・0.001 秒単位",
-                "Minimum 0.001 s • step 0.001 s",
+                "最小 0.0000001 秒・小数点以下7桁まで",
+                "Minimum 0.0000001 s • up to 7 decimal places",
             )
             .to_string();
         self.label(&helper, 30, 389, 560, 23);
@@ -733,7 +733,9 @@ impl App {
                 self.label(&label, 40, y + 4, 270, 25);
                 self.edit(
                     INTERVAL_POINT + i as u16,
-                    &model::format_interval(p.interval_ms.unwrap_or(self.settings.interval_ms)),
+                    &model::format_interval(
+                        p.interval_ticks.unwrap_or(self.settings.interval_ticks),
+                    ),
                     320,
                     y,
                     160,
@@ -894,7 +896,7 @@ impl App {
         self.label(&fast, 30, 232, 270, 25);
         self.edit(
             FAST_INTERVAL,
-            &model::format_interval(self.settings.fast_interval_ms),
+            &model::format_interval(self.settings.fast_interval_ticks),
             320,
             226,
             160,
@@ -1188,7 +1190,7 @@ impl App {
         self.recorded.push(Point {
             x,
             y,
-            interval_ms: None,
+            interval_ticks: None,
         });
         if self.selecting_area && self.recorded.len() == 2 {
             self.settings.area = Some(ClickArea::from_corners(
@@ -1368,12 +1370,12 @@ impl App {
             return;
         }
         if id == DEFAULT_INTERVAL {
-            let previous_common = self.settings.interval_ms;
-            self.settings.interval_ms = model::DEFAULT_INTERVAL_MS;
+            let previous_common = self.settings.interval_ticks;
+            self.settings.interval_ticks = model::DEFAULT_INTERVAL_TICKS;
             set_text(self.control(INTERVAL), "0.501");
             for (i, point) in self.settings.points.iter().enumerate() {
                 let editor = self.control(INTERVAL_POINT + i as u16);
-                if follows_common_interval(point.interval_ms, &text(editor), previous_common) {
+                if follows_common_interval(point.interval_ticks, &text(editor), previous_common) {
                     set_text(editor, "0.501");
                 }
             }
@@ -2583,7 +2585,7 @@ pub fn input_probe(path: &str) {
                     .map(|(i, ms)| Point {
                         x: origin.x + 100 + i as i32 * 100,
                         y: origin.y + 160,
-                        interval_ms: Some(*ms),
+                        interval_ticks: Some(*ms * model::TICKS_PER_MILLISECOND),
                     })
                     .collect();
                 let settings = Settings {
@@ -2626,16 +2628,16 @@ pub fn input_probe(path: &str) {
                 } else {
                     deltas.iter().sum::<f64>() / deltas.len() as f64
                 };
-                scenarios.push(serde_json::json!({"scenario":name,"expected_clicks":expected,"received_clicks":events.len(),"count_ok":events.len()==expected,"positions_ok":positions_ok,"buttons_ok":buttons_ok,"reported_clicks":progress.clicks,"engine_elapsed_ms":progress.elapsed_ms,"mean_input_ms":progress.mean_input_ms,"error":progress.error,"mean_interval_ms":average,"p95_interval_ms":sorted.get(sorted.len()*95/100),"interval_sample_ms":deltas.iter().take(12).collect::<Vec<_>>()}));
+                scenarios.push(serde_json::json!({"scenario":name,"expected_clicks":expected,"received_clicks":events.len(),"count_ok":events.len()==expected,"positions_ok":positions_ok,"buttons_ok":buttons_ok,"reported_clicks":progress.clicks,"engine_elapsed_ms":progress.elapsed_ms,"mean_input_ms":progress.mean_input_ms,"error":progress.error,"mean_interval_ticks":average,"p95_interval_ticks":sorted.get(sorted.len()*95/100),"interval_sample_ms":deltas.iter().take(12).collect::<Vec<_>>()}));
             }
             PROBE.with(|e| e.borrow_mut().clear());
             let settings = Settings {
                 points: vec![Point {
                     x: origin.x + 100,
                     y: origin.y + 160,
-                    interval_ms: None,
+                    interval_ticks: None,
                 }],
-                interval_ms: 30_000,
+                interval_ticks: 300_000_000,
                 ..Settings::default()
             };
             let mut runner = Runner::start(settings).map_err(|e| e.to_string())?;
@@ -2783,7 +2785,7 @@ mod tests {
                 bottom: 80
             })
         );
-        assert_eq!(a.settings.fast_interval_ms, 3);
+        assert_eq!(a.settings.fast_interval_ticks, 30_000);
         let (loaded, _) = Settings::load(&a.path).unwrap();
         assert_eq!(loaded.mode, ClickMode::Area);
         assert_eq!(loaded.area_step_px, 17);
@@ -2794,6 +2796,12 @@ mod tests {
         assert_eq!(a.settings.mode, ClickMode::Pointer);
         assert_eq!(unsafe { IsWindowEnabled(a.control(REPEAT)) }, 0);
         assert_eq!(text(a.control(FAST_INTERVAL)), "0.003");
+        set_text(a.control(FAST_INTERVAL), "0.0000001");
+        assert!(a.commit());
+        assert_eq!(a.settings.fast_interval_ticks, 1);
+        let (back, _) = Settings::load(&a.path).unwrap();
+        assert_eq!(back.fast_interval_ticks, 1);
+        assert_eq!(text(a.control(FAST_INTERVAL)), "0.0000001");
         let current = a.settings.area;
         set_text(a.control(AREA_TOP), "bad");
         assert!(!a.commit());
@@ -2806,7 +2814,7 @@ mod tests {
         a.settings.points = vec![Point {
             x: 1,
             y: 2,
-            interval_ms: None,
+            interval_ticks: None,
         }];
         a.settings.details_open = true;
         a.settings.per_point = true;
@@ -2817,9 +2825,9 @@ mod tests {
         }
         a.action(MODE);
         assert_eq!(a.settings.mode, ClickMode::Drag);
-        assert_eq!(a.settings.points[0].interval_ms, Some(11));
-        assert_eq!(a.settings.interval_ms, 501);
-        assert_eq!(a.settings.fast_interval_ms, 1);
+        assert_eq!(a.settings.points[0].interval_ticks, Some(110_000));
+        assert_eq!(a.settings.interval_ticks, model::DEFAULT_INTERVAL_TICKS);
+        assert_eq!(a.settings.fast_interval_ticks, model::TICKS_PER_MILLISECOND);
     }
     #[test]
     fn lock_key_is_reserved_when_migrating_previous_bindings() {
@@ -2833,9 +2841,9 @@ mod tests {
     }
     #[test]
     fn resetting_common_interval_preserves_pending_point_edits() {
-        assert!(follows_common_interval(None, "0.001", 1));
+        assert!(follows_common_interval(None, "0.0000001", 1));
         assert!(!follows_common_interval(None, "0.011", 1));
-        assert!(!follows_common_interval(Some(1), "0.001", 1));
+        assert!(!follows_common_interval(Some(1), "0.0000001", 1));
         assert!(!follows_common_interval(None, "invalid", 1));
     }
     #[test]
@@ -2854,7 +2862,7 @@ mod tests {
         let error = model::parse_interval("0.000").unwrap_err();
         assert_eq!(error.code, ErrorCode::IntervalRange);
         let english = error_text(&error, false);
-        assert!(english.contains("0.001"));
+        assert!(english.contains("0.0000001"));
         assert!(!english.contains("指定"));
         assert!(error_text(&error, true).contains("指定"));
     }
