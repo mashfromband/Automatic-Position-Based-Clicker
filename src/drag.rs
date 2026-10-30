@@ -86,6 +86,37 @@ struct Context {
     excluded_pid: u32,
 }
 thread_local! {static CONTEXT:RefCell<Option<Context>>=const {RefCell::new(None)};}
+/// Inspect cached top-level geometry in Z order. WindowFromPoint sends
+/// WM_NCHITTEST to other UI threads and must never be called by the hook or
+/// click worker: the UI thread can be joining those threads during Stop.
+pub(crate) fn point_hits_process(point: POINT, process: u32) -> bool {
+    unsafe {
+        let mut window = GetTopWindow(null_mut());
+        for _ in 0..512 {
+            if window.is_null() {
+                return false;
+            }
+            if IsWindowVisible(window) != 0
+                && IsIconic(window) == 0
+                && GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TRANSPARENT as isize == 0
+            {
+                let mut rect: RECT = std::mem::zeroed();
+                if GetWindowRect(window, &mut rect) != 0
+                    && point.x >= rect.left
+                    && point.x < rect.right
+                    && point.y >= rect.top
+                    && point.y < rect.bottom
+                {
+                    let mut pid = 0;
+                    GetWindowThreadProcessId(window, &mut pid);
+                    return pid == process;
+                }
+            }
+            window = GetWindow(window, GW_HWNDNEXT);
+        }
+        false
+    }
+}
 unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 {
         // The hook pointer is owned by Windows and valid only during this callback.
@@ -101,16 +132,12 @@ unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                 if ctx.state.stopping.load(Ordering::Acquire) {
                     return false;
                 }
-                let mut pid = 0;
-                unsafe {
-                    GetWindowThreadProcessId(WindowFromPoint(event.pt), &mut pid);
-                }
                 let suppress = ctx.gesture.event(
                     wp as u32,
                     event.pt.x,
                     event.pt.y,
                     false,
-                    pid == ctx.excluded_pid,
+                    point_hits_process(event.pt, ctx.excluded_pid),
                 );
                 ctx.state
                     .active

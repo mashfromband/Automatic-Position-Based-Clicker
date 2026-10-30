@@ -1,4 +1,4 @@
-use crate::drag::{DragMonitor, DragState};
+use crate::drag::{DragMonitor, DragState, point_hits_process};
 use crate::error::{ClickerError, ErrorCode};
 use crate::model::{ClickMode, Point, Settings};
 use serde::Serialize;
@@ -184,20 +184,16 @@ impl Runner {
                 if matches!(mode, ClickMode::Pointer | ClickMode::Drag) {
                     desktop.send_at_cursor(right)
                 } else {
-                    if mode == ClickMode::Area {
-                        let mut pid = 0;
-                        unsafe {
-                            GetWindowThreadProcessId(
-                                WindowFromPoint(POINT {
-                                    x: point.x,
-                                    y: point.y,
-                                }),
-                                &mut pid,
-                            );
-                        }
-                        if pid == std::process::id() {
-                            return Ok(false);
-                        }
+                    if mode == ClickMode::Area
+                        && point_hits_process(
+                            POINT {
+                                x: point.x,
+                                y: point.y,
+                            },
+                            std::process::id(),
+                        )
+                    {
+                        return Ok(false);
                     }
                     desktop.send(point, right).map(|_| true)
                 }
@@ -490,11 +486,7 @@ impl Desktop {
         if unsafe { GetCursorPos(&mut point) } == 0 {
             return Err(os_error(ErrorCode::InputSend));
         }
-        let mut pid = 0;
-        unsafe {
-            GetWindowThreadProcessId(WindowFromPoint(point), &mut pid);
-        }
-        if pid == std::process::id() {
+        if point_hits_process(point, std::process::id()) {
             return Ok(false);
         }
         self.validate(&Point {
