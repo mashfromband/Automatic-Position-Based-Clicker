@@ -312,7 +312,7 @@ impl Runner {
                                 && thread_shared
                                     .wait_for_hotkey_release
                                     .swap(false, Ordering::AcqRel)
-                                && [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
+                                && [VK_CONTROL, VK_MENU]
                                     .iter()
                                     .any(|key| unsafe { GetAsyncKeyState(*key as i32) } < 0)
                             {
