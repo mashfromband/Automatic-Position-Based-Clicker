@@ -1,10 +1,11 @@
 use multi_point_clicker::{
     engine::{Progress, Runner},
+    error::{ClickerError, ErrorCode},
     model::{self, ACTIONS, MAX_POINTS, Point, Settings},
 };
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     mem::{size_of, zeroed},
     path::PathBuf,
     ptr::{null, null_mut},
@@ -120,6 +121,108 @@ fn error_dialog(hwnd: HWND, s: &str) {
     }
 }
 
+fn error_text(error: &ClickerError, japanese: bool) -> String {
+    use ErrorCode::*;
+    let pair = match error.code {
+        IntervalRange => (
+            "間隔は 0.001〜3600.000 秒で指定してください。",
+            "Use an interval from 0.001 to 3600.000 seconds.",
+        ),
+        IntervalFormat => (
+            "秒数は小数点以下3桁までで指定してください（例: 0.501）。",
+            "Enter seconds with up to three decimal places (for example, 0.501).",
+        ),
+        PointLimit => (
+            "クリック位置は10か所までです。",
+            "You can save up to 10 click positions.",
+        ),
+        Limits => (
+            "待機時間または繰り返し回数が範囲外です。",
+            "Start delay or repeat count is out of range.",
+        ),
+        Config => ("設定の値が不正です。", "A settings value is invalid."),
+        SettingsRead => ("設定を読めません。", "Cannot read settings."),
+        SettingsJson => (
+            "設定ファイルの内容が不正です。",
+            "The settings file is invalid.",
+        ),
+        SettingsVersion => (
+            "未対応の設定ファイルの版です。",
+            "This settings version is not supported.",
+        ),
+        PointData => (
+            "クリック位置の形式が不正です。",
+            "A saved click position is invalid.",
+        ),
+        Coordinate => (
+            "クリック位置の座標が不正です。",
+            "A click coordinate is invalid.",
+        ),
+        SettingsBackup => (
+            "旧設定を保全できません。",
+            "Cannot back up the previous settings.",
+        ),
+        SettingsWrite => ("設定を保存できません。", "Cannot save settings."),
+        EmptyPoints => (
+            "先にクリック位置を記憶してください。",
+            "Record click positions first.",
+        ),
+        SignalCreate => (
+            "停止イベントを作成できません。",
+            "Cannot create the stop signal.",
+        ),
+        TimerCreate => (
+            "待機タイマーを作成できません。",
+            "Cannot create the interval timer.",
+        ),
+        TimerSet => (
+            "待機時間を設定できません。",
+            "Cannot set the interval timer.",
+        ),
+        TimerWait => (
+            "クリック間隔の待機に失敗しました。",
+            "Waiting for the next click failed.",
+        ),
+        ThreadStart => (
+            "クリック処理を開始できません。",
+            "Cannot start the click worker.",
+        ),
+        WorkerPanic => (
+            "クリック処理で予期しないエラーが発生しました。",
+            "The click worker encountered an unexpected error.",
+        ),
+        ScreenUnavailable => (
+            "画面の座標を取得できません。",
+            "Cannot read the screen coordinates.",
+        ),
+        PointOutside => (
+            "クリック位置が画面外です。再記録してください。",
+            "A click position is outside the screen. Record it again.",
+        ),
+        ScreenChanged => (
+            "画面構成が変わったため停止しました。位置を確認してください。",
+            "Stopped because the monitor layout changed. Check the saved positions.",
+        ),
+        InputSend => (
+            "マウス入力を送信できません。対象アプリの権限を確認してください。",
+            "Cannot send mouse input. Check the target application's permissions.",
+        ),
+        BenchmarkRange => (
+            "測定の範囲が不正です。",
+            "The measurement range is invalid.",
+        ),
+        Other => (
+            "処理を完了できません。",
+            "The operation could not be completed.",
+        ),
+    };
+    let base = if japanese { pair.0 } else { pair.1 };
+    match &error.detail {
+        Some(detail) => format!("{base}\n{detail}"),
+        None => base.into(),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Control {
     hwnd: HWND,
@@ -151,6 +254,7 @@ struct App {
     mouse_hook: HHOOK,
     capturing: Option<usize>,
     hotkeys_ready: bool,
+    wheel_remainder: i32,
 }
 
 impl App {
@@ -159,6 +263,36 @@ impl App {
     }
     fn s(&self, v: i32) -> i32 {
         (v as f64 * self.scale).round() as i32
+    }
+    fn refresh_fonts(&mut self) {
+        let (font, title) = make_fonts(self.scale);
+        if font.is_null() || title.is_null() {
+            unsafe {
+                if !font.is_null() {
+                    DeleteObject(font);
+                }
+                if !title.is_null() {
+                    DeleteObject(title);
+                }
+            }
+            return;
+        }
+        for control in self.controls.values().chain(self.labels.iter()) {
+            unsafe {
+                SendMessageW(control.hwnd, WM_SETFONT, font as usize, 1);
+            }
+        }
+        if let Some(header) = self.labels.first() {
+            unsafe {
+                SendMessageW(header.hwnd, WM_SETFONT, title as usize, 1);
+            }
+        }
+        unsafe {
+            DeleteObject(self.font);
+            DeleteObject(self.title_font);
+        }
+        self.font = font;
+        self.title_font = title;
     }
     fn control(&self, id: u16) -> HWND {
         self.controls.get(&id).map_or(null_mut(), |c| c.hwnd)
@@ -264,7 +398,7 @@ impl App {
     }
     fn save(&mut self) {
         if let Err(e) = self.settings.save(&self.path) {
-            self.message = e;
+            self.message = error_text(&e, self.settings.lang == "ja");
             self.saved_error = true;
         } else {
             self.saved_error = false;
@@ -273,7 +407,8 @@ impl App {
     }
     fn numbers(&mut self) -> Result<(), String> {
         if self.tab == 0 {
-            let interval = model::parse_interval(&text(self.control(INTERVAL)))?;
+            let interval = model::parse_interval(&text(self.control(INTERVAL)))
+                .map_err(|e| error_text(&e, self.settings.lang == "ja"))?;
             let repeat = text(self.control(REPEAT))
                 .trim()
                 .parse::<u32>()
@@ -289,9 +424,10 @@ impl App {
             let mut overrides = vec![];
             if self.settings.details_open && self.settings.per_point && !self.recording {
                 for i in 0..self.settings.points.len() {
-                    overrides.push(model::parse_interval(&text(
-                        self.control(INTERVAL_POINT + i as u16),
-                    ))?);
+                    overrides.push(
+                        model::parse_interval(&text(self.control(INTERVAL_POINT + i as u16)))
+                            .map_err(|e| error_text(&e, self.settings.lang == "ja"))?,
+                    );
                 }
             }
             self.settings.interval_ms = interval;
@@ -339,7 +475,7 @@ impl App {
     }
     fn refresh_theme(&self) {
         let dark = if self.settings.theme == "system" {
-            let mut light: u32 = 0;
+            let mut light: u32 = 1;
             let mut len = size_of::<u32>() as u32;
             unsafe {
                 RegGetValueW(
@@ -712,10 +848,15 @@ impl App {
                 runner.stop();
                 self.last = runner.snapshot();
             }
-            self.message = self.last.error.clone().unwrap_or_else(|| {
-                self.t("自動クリックが完了しました。", "Auto-clicking finished.")
-                    .into()
-            });
+            self.message = self
+                .last
+                .error
+                .as_ref()
+                .map(|e| error_text(e, self.settings.lang == "ja"))
+                .unwrap_or_else(|| {
+                    self.t("自動クリックが完了しました。", "Auto-clicking finished.")
+                        .into()
+                });
             self.rebuild();
             return;
         }
@@ -875,10 +1016,15 @@ impl App {
             self.cancel_capture();
             self.tab = if id == NAV_MAIN { 0 } else { 1 };
             self.scroll = 0;
+            self.wheel_remainder = 0;
             self.rebuild();
             return;
         }
         if id == THEME {
+            if !self.busy() && !self.commit() {
+                self.sync_checks();
+                return;
+            }
             self.settings.theme = match self.settings.theme.as_str() {
                 "system" => "dark",
                 "dark" => "light",
@@ -890,6 +1036,10 @@ impl App {
             return;
         }
         if id == TOPMOST {
+            if !self.busy() && !self.commit() {
+                self.sync_checks();
+                return;
+            }
             self.settings.topmost = !self.settings.topmost;
             unsafe {
                 SetWindowPos(
@@ -913,7 +1063,20 @@ impl App {
         if self.busy() {
             return;
         }
+        if id == DEFAULT_INTERVAL {
+            self.settings.interval_ms = model::DEFAULT_INTERVAL_MS;
+            set_text(self.control(INTERVAL), "0.501");
+            for (i, point) in self.settings.points.iter().enumerate() {
+                if point.interval_ms.is_none() {
+                    set_text(self.control(INTERVAL_POINT + i as u16), "0.501");
+                }
+            }
+            self.message.clear();
+            self.save();
+            return;
+        }
         if !self.commit() {
+            self.sync_checks();
             return;
         }
         self.cancel_capture();
@@ -923,7 +1086,12 @@ impl App {
                     SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), GetModuleHandleW(null()), 0)
                 };
                 if self.mouse_hook.is_null() {
-                    self.message = "位置記録のマウス監視を開始できません。".into();
+                    self.message = self
+                        .t(
+                            "位置記録のマウス監視を開始できません。",
+                            "Cannot start mouse recording.",
+                        )
+                        .into();
                     set_text(self.control(MESSAGE), &self.message);
                     return;
                 }
@@ -963,7 +1131,7 @@ impl App {
                         self.rebuild();
                     }
                     Err(e) => {
-                        self.message = e;
+                        self.message = error_text(&e, self.settings.lang == "ja");
                         set_text(self.control(MESSAGE), &self.message);
                     }
                 }
@@ -975,11 +1143,6 @@ impl App {
             }
             INDIVIDUAL => {
                 self.settings.per_point = !self.settings.per_point;
-                self.save();
-                self.rebuild();
-            }
-            DEFAULT_INTERVAL => {
-                self.settings.interval_ms = model::DEFAULT_INTERVAL_MS;
                 self.save();
                 self.rebuild();
             }
@@ -1037,7 +1200,12 @@ impl App {
                     )
                 };
                 if self.keyboard_hook.is_null() {
-                    self.message = "キーの入力を監視できません。".into();
+                    self.message = self
+                        .t(
+                            "キーの入力を監視できません。",
+                            "Cannot capture keyboard input.",
+                        )
+                        .into();
                     set_text(self.control(MESSAGE), &self.message);
                     return;
                 }
@@ -1057,8 +1225,14 @@ impl App {
         }
         for (i, action) in ACTIONS.iter().enumerate() {
             let Some((mods, key)) = parse_hotkey(&self.settings.hotkeys[*action]) else {
+                for id in 1..=4 {
+                    unsafe {
+                        UnregisterHotKey(self.hwnd, id);
+                    }
+                }
                 return Err(format!(
-                    "Invalid hotkey: {}",
+                    "{}: {}",
+                    self.t("ショートカットの形式が不正です", "Invalid hotkey"),
                     self.settings.hotkeys[*action]
                 ));
             };
@@ -1139,8 +1313,77 @@ impl App {
             self.keyboard_hook = null_mut();
         }
     }
+    fn sync_checks(&self) {
+        unsafe {
+            SendMessageW(
+                self.control(INDIVIDUAL),
+                BM_SETCHECK,
+                usize::from(self.settings.per_point),
+                0,
+            );
+            SendMessageW(
+                self.control(TOPMOST),
+                BM_SETCHECK,
+                usize::from(self.settings.topmost),
+                0,
+            );
+        }
+    }
 }
 
+fn wheel_steps(remainder: &mut i32, delta: i32) -> i32 {
+    let total = *remainder + delta;
+    *remainder = total % 120;
+    total / 120
+}
+fn repair_hotkeys(settings: &mut Settings) -> bool {
+    let mut used = HashSet::new();
+    let mut invalid = vec![];
+    for action in ACTIONS {
+        match settings.hotkeys.get(action).and_then(|v| parse_hotkey(v)) {
+            Some(binding) if used.insert(binding) => {}
+            _ => invalid.push(action),
+        }
+    }
+    if invalid.is_empty() {
+        return false;
+    }
+    let defaults = model::default_hotkeys();
+    for action in invalid {
+        let candidate = std::iter::once(&defaults[action])
+            .chain(ACTIONS.iter().map(|a| &defaults[*a]))
+            .find(|key| parse_hotkey(key).is_some_and(|binding| !used.contains(&binding)))
+            .expect("four defaults suffice for four actions")
+            .clone();
+        used.insert(parse_hotkey(&candidate).unwrap());
+        settings.hotkeys.insert(action.into(), candidate);
+    }
+    true
+}
+fn make_fonts(scale: f64) -> (HFONT, HFONT) {
+    let create = |size: f64, weight: i32| unsafe {
+        CreateFontW(
+            -(size * scale).round() as i32,
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            0,
+            0,
+            CLEARTYPE_QUALITY as u32,
+            0,
+            w!("Yu Gothic UI"),
+        )
+    };
+    (
+        create(15., FW_NORMAL as i32),
+        create(18., FW_SEMIBOLD as i32),
+    )
+}
 fn format_hotkey(s: &str) -> String {
     s.split('+')
         .map(|s| match s {
@@ -1168,6 +1411,20 @@ fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
     let token = *parts.last()?;
     let key = match token {
         "space" => VK_SPACE as u32,
+        "backspace" => VK_BACK as u32,
+        "page_up" => VK_PRIOR as u32,
+        "page_down" => VK_NEXT as u32,
+        "pause" => VK_PAUSE as u32,
+        "print_screen" => VK_SNAPSHOT as u32,
+        "caps_lock" => VK_CAPITAL as u32,
+        "num_lock" => VK_NUMLOCK as u32,
+        "scroll_lock" => VK_SCROLL as u32,
+        "menu" => VK_APPS as u32,
+        "decimal" => VK_DECIMAL as u32,
+        "add" => VK_ADD as u32,
+        "subtract" => VK_SUBTRACT as u32,
+        "multiply" => VK_MULTIPLY as u32,
+        "divide" => VK_DIVIDE as u32,
         "enter" => VK_RETURN as u32,
         "esc" => VK_ESCAPE as u32,
         "tab" => VK_TAB as u32,
@@ -1195,6 +1452,19 @@ fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
             {
                 VK_NUMPAD0 as u32 + n
             } else {
+                if token.chars().count() == 1 {
+                    let c = token.chars().next()? as u32;
+                    if c <= u16::MAX as u32 {
+                        let scan = unsafe { VkKeyScanW(c as u16) };
+                        if scan != -1 {
+                            let flags = (scan as u16 >> 8) as u32;
+                            mods |= if flags & 1 != 0 { MOD_SHIFT } else { 0 };
+                            mods |= if flags & 2 != 0 { MOD_CONTROL } else { 0 };
+                            mods |= if flags & 4 != 0 { MOD_ALT } else { 0 };
+                            return Some((mods, (scan as u16 & 0xff) as u32));
+                        }
+                    }
+                }
                 token
                     .strip_prefix("vk")
                     .and_then(|x| x.parse::<u32>().ok())
@@ -1511,7 +1781,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 true
             }
             WM_MOUSEWHEEL => {
-                app.scroll_by(-((wp >> 16) as u16 as i16 as i32) / 120 * app.s(65));
+                let steps = wheel_steps(&mut app.wheel_remainder, (wp >> 16) as u16 as i16 as i32);
+                app.scroll_by(-steps * app.s(65));
                 true
             }
             WM_VSCROLL => {
@@ -1537,6 +1808,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             }
             WM_DPICHANGED => {
                 app.scale = (wp & 0xffff) as f64 / 96.;
+                app.refresh_fonts();
                 let rect = unsafe { &*(lp as *const RECT) };
                 unsafe {
                     SetWindowPos(
@@ -1553,6 +1825,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 true
             }
             WM_CLOSE => {
+                app.cancel_capture();
                 if let Some(mut r) = app.runner.take() {
                     r.stop();
                 }
@@ -1561,30 +1834,29 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 }
                 app.save();
                 if app.saved_error {
-                    let m = app.message.clone();
-                    error_dialog(hwnd, &m);
-                    return true;
+                    let prompt = format!(
+                        "{}\n\n{}",
+                        app.message,
+                        app.t(
+                            "変更を保存せずに終了しますか？",
+                            "Exit without saving these changes?"
+                        )
+                    );
+                    if unsafe {
+                        MessageBoxW(
+                            hwnd,
+                            wide(&prompt).as_ptr(),
+                            w!("Multi Point Clicker"),
+                            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+                        )
+                    } != IDYES
+                    {
+                        app.rebuild();
+                        return true;
+                    }
                 }
                 unsafe {
                     DestroyWindow(hwnd);
-                }
-                true
-            }
-            WM_DESTROY => {
-                if let Some(mut r) = app.runner.take() {
-                    r.stop();
-                }
-                app.clear_markers();
-                ROOT.store(0, Ordering::Relaxed);
-                CAPTURE.store(0, Ordering::Relaxed);
-                unsafe {
-                    UnhookWindowsHookEx(app.mouse_hook);
-                    UnhookWindowsHookEx(app.keyboard_hook);
-                    for i in 1..=4 {
-                        UnregisterHotKey(hwnd, i);
-                    }
-                    KillTimer(hwnd, TICK);
-                    PostQuitMessage(0);
                 }
                 true
             }
@@ -1604,7 +1876,16 @@ pub fn run() {
         let instance = GetModuleHandleW(null());
         let mutex = CreateMutexW(null(), 0, w!("Local\\MultiPointClickerRust"));
         if mutex.is_null() {
-            error_dialog(null_mut(), "アプリの起動ロックを作成できません。");
+            let japanese =
+                windows_sys::Win32::Globalization::GetUserDefaultUILanguage() & 0x3ff == 0x11;
+            error_dialog(
+                null_mut(),
+                if japanese {
+                    "アプリの起動ロックを作成できません。"
+                } else {
+                    "Cannot create the startup lock."
+                },
+            );
             return;
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
@@ -1621,7 +1902,14 @@ pub fn run() {
         let (mut settings, migrated) = match Settings::load(&path) {
             Ok(s) => s,
             Err(e) => {
-                error_dialog(null_mut(), &e);
+                error_dialog(
+                    null_mut(),
+                    &error_text(
+                        &e,
+                        windows_sys::Win32::Globalization::GetUserDefaultUILanguage() & 0x3ff
+                            == 0x11,
+                    ),
+                );
                 CloseHandle(mutex);
                 return;
             }
@@ -1677,7 +1965,14 @@ pub fn run() {
             null(),
         );
         if hwnd.is_null() {
-            error_dialog(null_mut(), "アプリのウィンドウを作成できません。");
+            error_dialog(
+                null_mut(),
+                if settings.lang == "ja" {
+                    "アプリのウィンドウを作成できません。"
+                } else {
+                    "Cannot create the application window."
+                },
+            );
             CloseHandle(mutex);
             return;
         }
@@ -1692,38 +1987,8 @@ pub fn run() {
         if !small_icon.is_null() {
             SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small_icon as isize);
         }
-        let font = CreateFontW(
-            -(15. * scale) as i32,
-            0,
-            0,
-            0,
-            FW_NORMAL as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as u32,
-            0,
-            0,
-            CLEARTYPE_QUALITY as u32,
-            0,
-            w!("Yu Gothic UI"),
-        );
-        let title_font = CreateFontW(
-            -(18. * scale) as i32,
-            0,
-            0,
-            0,
-            FW_SEMIBOLD as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as u32,
-            0,
-            0,
-            CLEARTYPE_QUALITY as u32,
-            0,
-            w!("Yu Gothic UI"),
-        );
+        let scale = GetDpiForWindow(hwnd).max(96) as f64 / 96.;
+        let (font, title_font) = make_fonts(scale);
         ROOT.store(hwnd as usize, Ordering::Relaxed);
         let mut app = App {
             hwnd,
@@ -1748,10 +2013,14 @@ pub fn run() {
             mouse_hook: null_mut(),
             capturing: None,
             hotkeys_ready: false,
+            wheel_remainder: 0,
         };
         if migrated {
-            app.message =
-                "旧設定とクリック位置を移行しました。間隔は0.501秒から開始します。".into();
+            app.message=app.t("旧設定とクリック位置を移行しました。間隔は0.501秒から開始します。","Previous positions and settings were imported. The interval starts at 0.501 seconds.").into();
+            app.save();
+        }
+        if repair_hotkeys(&mut app.settings) {
+            app.message=app.t("未対応または重複した旧キーを利用可能な初期キーに変更しました。設定で確認できます。","Unsupported or duplicate legacy hotkeys were reset to available defaults. Check Settings.").into();
             app.save();
         }
         if let Err(e) = app.register_hotkeys() {
@@ -1785,10 +2054,10 @@ pub fn run() {
                 if !app.keyboard_hook.is_null() {
                     UnhookWindowsHookEx(app.keyboard_hook);
                 }
+                DeleteObject(app.font);
+                DeleteObject(app.title_font);
             }
         });
-        DeleteObject(font);
-        DeleteObject(title_font);
         CloseHandle(mutex);
     }
 }
@@ -1963,7 +2232,7 @@ pub fn input_probe(path: &str) {
                     button: if right { "right" } else { "left" }.into(),
                     ..Settings::default()
                 };
-                let mut runner = Runner::start(settings)?;
+                let mut runner = Runner::start(settings).map_err(|e| e.to_string())?;
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while !runner.finished() && Instant::now() < deadline {
                     pump();
@@ -2008,7 +2277,7 @@ pub fn input_probe(path: &str) {
                 interval_ms: 30_000,
                 ..Settings::default()
             };
-            let mut runner = Runner::start(settings)?;
+            let mut runner = Runner::start(settings).map_err(|e| e.to_string())?;
             let deadline = Instant::now() + Duration::from_secs(1);
             while runner.snapshot().clicks == 0 && Instant::now() < deadline {
                 pump();
@@ -2043,6 +2312,70 @@ pub fn input_probe(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn high_resolution_wheel_accumulates_small_deltas() {
+        let mut rest = 0;
+        for _ in 0..3 {
+            assert_eq!(wheel_steps(&mut rest, 30), 0);
+        }
+        assert_eq!(wheel_steps(&mut rest, 30), 1);
+        assert_eq!(rest, 0);
+        assert_eq!(wheel_steps(&mut rest, -60), 0);
+        assert_eq!(wheel_steps(&mut rest, -60), -1);
+    }
+    #[test]
+    fn english_errors_are_selected_by_category() {
+        let error = model::parse_interval("0.000").unwrap_err();
+        assert_eq!(error.code, ErrorCode::IntervalRange);
+        let english = error_text(&error, false);
+        assert!(english.contains("0.001"));
+        assert!(!english.contains("指定"));
+        assert!(error_text(&error, true).contains("指定"));
+    }
+    #[test]
+    fn legacy_keys_and_invalid_bindings_are_migrated() {
+        for value in ["ctrl+alt+page_up", "alt+pause", "ctrl+;", "shift+."] {
+            assert!(parse_hotkey(value).is_some(), "{value}");
+        }
+        let mut s = Settings::default();
+        s.hotkeys
+            .insert("record_start".into(), "unsupported_key".into());
+        let valid = s.hotkeys["click_stop"].clone();
+        assert!(repair_hotkeys(&mut s));
+        assert_eq!(s.hotkeys["click_stop"], valid);
+        assert!(
+            ACTIONS
+                .iter()
+                .all(|a| parse_hotkey(&s.hotkeys[*a]).is_some())
+        );
+    }
+    #[test]
+    fn fonts_follow_the_window_dpi() {
+        unsafe {
+            let (a, b) = make_fonts(1.);
+            let (c, d) = make_fonts(1.5);
+            let mut normal: LOGFONTW = zeroed();
+            let mut scaled: LOGFONTW = zeroed();
+            assert!(
+                GetObjectW(
+                    a,
+                    size_of::<LOGFONTW>() as i32,
+                    (&mut normal as *mut LOGFONTW).cast()
+                ) > 0
+            );
+            assert!(
+                GetObjectW(
+                    c,
+                    size_of::<LOGFONTW>() as i32,
+                    (&mut scaled as *mut LOGFONTW).cast()
+                ) > 0
+            );
+            assert!(scaled.lfHeight.abs() > normal.lfHeight.abs());
+            for h in [a, b, c, d] {
+                DeleteObject(h);
+            }
+        }
+    }
     #[test]
     fn keyboard_bindings_round_trip_and_cover_no_numpad() {
         for combo in [

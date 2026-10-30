@@ -1,3 +1,4 @@
+use crate::error::{ClickerError, ErrorCode};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -34,6 +35,35 @@ pub struct Settings {
     pub hotkeys: BTreeMap<String, String>,
     pub per_point: bool,
     pub details_open: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct LegacySettings {
+    lang: String,
+    theme: String,
+    points: Vec<(i32, i32)>,
+    interval: f64,
+    repeat: u32,
+    delay: u64,
+    button: String,
+    topmost: bool,
+    hotkeys: BTreeMap<String, String>,
+}
+impl Default for LegacySettings {
+    fn default() -> Self {
+        Self {
+            lang: "ja".into(),
+            theme: "system".into(),
+            points: vec![],
+            interval: 1.,
+            repeat: 0,
+            delay: 0,
+            button: "left".into(),
+            topmost: false,
+            hotkeys: default_hotkeys(),
+        }
+    }
 }
 
 pub fn default_hotkeys() -> BTreeMap<String, String> {
@@ -75,95 +105,83 @@ impl Settings {
         }
     }
 
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), ClickerError> {
         if !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&self.interval_ms) {
-            return Err("間隔は 0.001〜3600.000 秒で指定してください。".into());
+            return Err(ErrorCode::IntervalRange.into());
         }
         if self.points.len() > MAX_POINTS {
-            return Err("クリック位置は10か所までです。".into());
+            return Err(ErrorCode::PointLimit.into());
         }
         if self.delay_ms > 30_000 || self.repeat > 999_999 {
-            return Err("待機時間または繰り返し回数が範囲外です。".into());
+            return Err(ErrorCode::Limits.into());
         }
         for p in &self.points {
             if p.interval_ms
                 .is_some_and(|v| !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&v))
             {
-                return Err("個別の間隔は 0.001〜3600.000 秒で指定してください。".into());
+                return Err(ErrorCode::IntervalRange.into());
             }
         }
         if !matches!(self.lang.as_str(), "ja" | "en")
             || !matches!(self.theme.as_str(), "light" | "dark" | "system")
             || !matches!(self.button.as_str(), "left" | "right")
         {
-            return Err("設定の値が不正です。".into());
+            return Err(ErrorCode::Config.into());
         }
         Ok(())
     }
 
-    pub fn load(path: &Path) -> Result<(Self, bool), String> {
+    pub fn load(path: &Path) -> Result<(Self, bool), ClickerError> {
         let raw = match fs::read(path) {
             Ok(raw) => raw,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok((Self::default(), false));
             }
-            Err(e) => return Err(format!("設定を読めません: {e}")),
+            Err(e) => {
+                return Err(ClickerError::with_detail(
+                    ErrorCode::SettingsRead,
+                    e.to_string(),
+                ));
+            }
         };
-        let value: serde_json::Value =
-            serde_json::from_slice(&raw).map_err(|e| format!("設定のJSONが不正です: {e}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&raw)
+            .map_err(|e| ClickerError::with_detail(ErrorCode::SettingsJson, e.to_string()))?;
+        if !value.is_object() {
+            return Err(ErrorCode::Config.into());
+        }
         let migrated = value.get("version").is_none();
         let mut settings = if migrated {
-            let mut s = Self::default();
-            if let Some(v) = value.get("lang").and_then(|v| v.as_str()) {
-                s.lang = v.into();
+            let old: LegacySettings = serde_json::from_value(value)
+                .map_err(|e| ClickerError::with_detail(ErrorCode::SettingsJson, e.to_string()))?;
+            if !old.interval.is_finite() || !(0.001..=3600.).contains(&old.interval) {
+                return Err(ErrorCode::Config.into());
             }
-            if let Some(v) = value.get("theme").and_then(|v| v.as_str()) {
-                s.theme = v.into();
-            }
-            if let Some(v) = value.get("repeat").and_then(|v| v.as_u64()) {
-                s.repeat = v.min(999_999) as u32;
-            }
-            if let Some(v) = value.get("delay").and_then(|v| v.as_u64()) {
-                s.delay_ms = v.min(30) * 1000;
-            }
-            if let Some(v) = value.get("button").and_then(|v| v.as_str()) {
-                s.button = v.into();
-            }
-            s.topmost = value
-                .get("topmost")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if let Some(v) = value.get("hotkeys") {
-                s.hotkeys = serde_json::from_value(v.clone()).map_err(|e| e.to_string())?;
-            }
-            if let Some(points) = value.get("points").and_then(|v| v.as_array()) {
-                for p in points.iter().take(MAX_POINTS) {
-                    let coords = p
-                        .as_array()
-                        .filter(|p| p.len() == 2)
-                        .ok_or("クリック位置の形式が不正です。")?;
-                    let x = coords[0]
-                        .as_i64()
-                        .and_then(|x| i32::try_from(x).ok())
-                        .ok_or("X座標が不正です。")?;
-                    let y = coords[1]
-                        .as_i64()
-                        .and_then(|y| i32::try_from(y).ok())
-                        .ok_or("Y座標が不正です。")?;
-                    s.points.push(Point {
+            // The owner requested 0.501 seconds for the first Rust launch, including migration.
+            Self {
+                lang: old.lang,
+                theme: old.theme,
+                points: old
+                    .points
+                    .into_iter()
+                    .map(|(x, y)| Point {
                         x,
                         y,
                         interval_ms: None,
-                    });
-                }
+                    })
+                    .collect(),
+                repeat: old.repeat,
+                delay_ms: old.delay.checked_mul(1000).ok_or(ErrorCode::Limits)?,
+                button: old.button,
+                topmost: old.topmost,
+                hotkeys: old.hotkeys,
+                ..Self::default()
             }
-            // The owner requested 0.501 seconds for the first Rust launch, including migration.
-            s
         } else {
             if value.get("version").and_then(|v| v.as_u64()) != Some(2) {
-                return Err("未対応の設定ファイルの版です。".into());
+                return Err(ErrorCode::SettingsVersion.into());
             }
-            serde_json::from_value(value).map_err(|e| format!("設定を解釈できません: {e}"))?
+            serde_json::from_value(value)
+                .map_err(|e| ClickerError::with_detail(ErrorCode::SettingsJson, e.to_string()))?
         };
         for (key, value) in default_hotkeys() {
             settings.hotkeys.entry(key).or_insert(value);
@@ -180,53 +198,72 @@ impl Settings {
                     use std::io::Write;
                     file.write_all(&raw)
                         .and_then(|_| file.sync_all())
-                        .map_err(|e| format!("旧設定を保全できません: {e}"))?;
+                        .map_err(|e| {
+                            ClickerError::with_detail(ErrorCode::SettingsBackup, e.to_string())
+                        })?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(format!("旧設定を保全できません: {e}")),
+                Err(e) => {
+                    return Err(ClickerError::with_detail(
+                        ErrorCode::SettingsBackup,
+                        e.to_string(),
+                    ));
+                }
             }
         }
         Ok((settings, migrated))
     }
 
-    pub fn save(&self, path: &Path) -> Result<(), String> {
+    pub fn save(&self, path: &Path) -> Result<(), ClickerError> {
         use std::io::Write;
         self.validate()?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            fs::create_dir_all(parent)
+                .map_err(|e| ClickerError::with_detail(ErrorCode::SettingsWrite, e.to_string()))?;
         }
         let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-        let mut file = fs::File::create(&temp).map_err(|e| e.to_string())?;
-        let contents = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
-        file.write_all(&contents)
-            .and_then(|_| file.sync_all())
-            .map_err(|e| e.to_string())?;
-        drop(file);
-        #[cfg(windows)]
-        {
-            use std::os::windows::ffi::OsStrExt;
-            use windows_sys::Win32::Storage::FileSystem::{
-                MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-            };
-            let source: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
-            let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-            if unsafe {
-                MoveFileExW(
-                    source.as_ptr(),
-                    destination.as_ptr(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                )
-            } == 0
+        let mut created = false;
+        let result = (|| -> Result<(), ClickerError> {
+            let mut file = fs::File::create(&temp)
+                .map_err(|e| ClickerError::with_detail(ErrorCode::SettingsWrite, e.to_string()))?;
+            created = true;
+            let contents = serde_json::to_vec_pretty(self)
+                .map_err(|e| ClickerError::with_detail(ErrorCode::SettingsWrite, e.to_string()))?;
+            file.write_all(&contents)
+                .and_then(|_| file.sync_all())
+                .map_err(|e| ClickerError::with_detail(ErrorCode::SettingsWrite, e.to_string()))?;
+            drop(file);
+            #[cfg(windows)]
             {
-                return Err(format!(
-                    "設定を保存できません: {}",
-                    std::io::Error::last_os_error()
-                ));
+                use std::os::windows::ffi::OsStrExt;
+                use windows_sys::Win32::Storage::FileSystem::{
+                    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+                };
+                let source: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+                let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+                if unsafe {
+                    MoveFileExW(
+                        source.as_ptr(),
+                        destination.as_ptr(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                    )
+                } == 0
+                {
+                    return Err(ClickerError::with_detail(
+                        ErrorCode::SettingsWrite,
+                        std::io::Error::last_os_error().to_string(),
+                    ));
+                }
             }
+            #[cfg(not(windows))]
+            fs::rename(&temp, path)
+                .map_err(|e| ClickerError::with_detail(ErrorCode::SettingsWrite, e.to_string()))?;
+            Ok(())
+        })();
+        if result.is_err() && created {
+            let _ = fs::remove_file(&temp);
         }
-        #[cfg(not(windows))]
-        fs::rename(temp, path).map_err(|e| e.to_string())?;
-        Ok(())
+        result
     }
 }
 
@@ -239,7 +276,7 @@ pub fn settings_path() -> PathBuf {
 }
 
 /// Parse exact millisecond decimal seconds without floating point rounding.
-pub fn parse_interval(text: &str) -> Result<u64, String> {
+pub fn parse_interval(text: &str) -> Result<u64, ClickerError> {
     let text = text.trim();
     let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
     if whole.is_empty()
@@ -247,18 +284,18 @@ pub fn parse_interval(text: &str) -> Result<u64, String> {
         || fraction.len() > 3
         || !fraction.bytes().all(|b| b.is_ascii_digit())
     {
-        return Err("秒数は小数点以下3桁までで指定してください（例: 0.501）。".into());
+        return Err(ErrorCode::IntervalFormat.into());
     }
-    let whole: u64 = whole.parse().map_err(|_| "秒数が範囲外です。")?;
+    let whole: u64 = whole.parse().map_err(|_| ErrorCode::IntervalRange)?;
     let fraction: u64 = format!("{fraction:0<3}")
         .parse()
-        .map_err(|_| "秒数が不正です。")?;
+        .map_err(|_| ErrorCode::IntervalFormat)?;
     let value = whole
         .checked_mul(1000)
         .and_then(|w| w.checked_add(fraction))
-        .ok_or("秒数が範囲外です。")?;
+        .ok_or(ErrorCode::IntervalRange)?;
     if !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&value) {
-        return Err("間隔は 0.001〜3600.000 秒で指定してください。".into());
+        return Err(ErrorCode::IntervalRange.into());
     }
     Ok(value)
 }
@@ -360,6 +397,56 @@ mod tests {
         fs::write(&path, b"{broken").unwrap();
         assert!(Settings::load(&path).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"{broken");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn malformed_legacy_values_never_overwrite_or_create_a_backup() {
+        let dir =
+            std::env::temp_dir().join(format!("clicker-legacy-invalid-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        for raw in [
+            "null",
+            "[]",
+            r#"{"points":"invalid"}"#,
+            r#"{"repeat":true}"#,
+            r#"{"topmost":"false"}"#,
+            r#"{"interval":"0.06"}"#,
+            r#"{"points":[[1,"2"]]}"#,
+        ] {
+            fs::write(&path, raw).unwrap();
+            assert!(Settings::load(&path).is_err(), "{raw}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+            assert!(!dir.join("settings.python-backup.json").exists());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn failed_atomic_replace_preserves_the_original_and_cleans_its_temp() {
+        let dir = std::env::temp_dir().join(format!("clicker-readonly-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let original = Settings::default();
+        original.save(&path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let saved_permissions = fs::metadata(&path).unwrap().permissions();
+        let mut readonly = saved_permissions.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&path, readonly).unwrap();
+        let changed = Settings {
+            interval_ms: 1,
+            ..Settings::default()
+        };
+        let result = changed.save(&path);
+        fs::set_permissions(&path, saved_permissions).unwrap();
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(
+            !path
+                .with_extension(format!("{}.tmp", std::process::id()))
+                .exists()
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }
