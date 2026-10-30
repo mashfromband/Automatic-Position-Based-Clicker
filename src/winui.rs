@@ -1,7 +1,7 @@
 use multi_point_clicker::{
     engine::{Progress, Runner},
     error::{ClickerError, ErrorCode},
-    model::{self, ACTIONS, MAX_POINTS, Point, Settings},
+    model::{self, ACTIONS, ClickArea, ClickMode, MAX_POINTS, Point, Settings},
 };
 use std::{
     cell::RefCell,
@@ -47,6 +47,16 @@ const BUTTON: u16 = 41;
 const THEME: u16 = 42;
 const TOPMOST: u16 = 43;
 const RESET_KEYS: u16 = 44;
+const MODE: u16 = 60;
+const AREA_SELECT: u16 = 61;
+const AREA_LEFT: u16 = 62;
+const AREA_TOP: u16 = 63;
+const AREA_RIGHT: u16 = 64;
+const AREA_BOTTOM: u16 = 65;
+const AREA_STEP: u16 = 66;
+const FAST_INTERVAL: u16 = 67;
+const LOCK: u16 = 68;
+const LOCK_HOTKEY: i32 = 5;
 const INTERVAL_POINT: u16 = 100;
 const DELETE_POINT: u16 = 200;
 const CAPTURE_KEY: u16 = 300;
@@ -124,13 +134,25 @@ fn error_dialog(hwnd: HWND, s: &str) {
 fn error_text(error: &ClickerError, japanese: bool) -> String {
     use ErrorCode::*;
     let pair = match error.code {
+        AreaMissing => (
+            "先に範囲の2隅を指定してください。",
+            "Select the two corners of a region first.",
+        ),
+        AreaInvalid => (
+            "範囲の座標または配置間隔が不正です（1〜4096 px）。",
+            "Invalid region coordinates or grid spacing (1–4096 px).",
+        ),
+        InputMonitor => (
+            "ドラッグの入力監視を開始できません。",
+            "Cannot start monitoring physical drag input.",
+        ),
         IntervalRange => (
-            "間隔は 0.001〜3600.000 秒で指定してください。",
-            "Use an interval from 0.001 to 3600.000 seconds.",
+            "間隔は 0.0000001〜3600.0000000 秒で指定してください。",
+            "Use an interval from 0.0000001 to 3600.0000000 seconds.",
         ),
         IntervalFormat => (
-            "秒数は小数点以下3桁までで指定してください（例: 0.501）。",
-            "Enter seconds with up to three decimal places (for example, 0.501).",
+            "秒数は小数点以下7桁までで指定してください（例: 0.0000001）。",
+            "Enter seconds with up to seven decimal places (for example, 0.0000001).",
         ),
         PointLimit => (
             "クリック位置は10か所までです。",
@@ -254,7 +276,10 @@ struct App {
     mouse_hook: HHOOK,
     capturing: Option<usize>,
     hotkeys_ready: bool,
+    lock_hotkey_ready: bool,
     wheel_remainder: i32,
+    main_offset: i32,
+    selecting_area: bool,
 }
 
 impl App {
@@ -309,6 +334,11 @@ impl App {
         bounds: [i32; 4],
     ) -> HWND {
         let [x, y, w, h] = bounds;
+        let y = if self.tab == 0 && y >= 112 {
+            y + self.main_offset
+        } else {
+            y
+        };
         // All controls and font handles live on this UI thread and are destroyed before the fonts.
         let child = unsafe {
             CreateWindowExW(
@@ -407,6 +437,46 @@ impl App {
     }
     fn numbers(&mut self) -> Result<(), String> {
         if self.tab == 0 {
+            let fast = model::parse_interval(&text(self.control(FAST_INTERVAL)))
+                .map_err(|e| error_text(&e, self.settings.lang == "ja"))?;
+            let step = text(self.control(AREA_STEP)).parse::<u32>().map_err(|_| {
+                error_text(&ErrorCode::AreaInvalid.into(), self.settings.lang == "ja")
+            })?;
+            if !(1..=4096).contains(&step) {
+                return Err(error_text(
+                    &ErrorCode::AreaInvalid.into(),
+                    self.settings.lang == "ja",
+                ));
+            }
+            let mut corners = Vec::new();
+            let mut present = 0;
+            for id in [AREA_LEFT, AREA_TOP, AREA_RIGHT, AREA_BOTTOM] {
+                let value = text(self.control(id));
+                if !value.trim().is_empty() {
+                    present += 1;
+                }
+                corners.push(value);
+            }
+            let region = if present == 0 {
+                None
+            } else if present == 4 {
+                let values = corners
+                    .iter()
+                    .map(|s| s.trim().parse::<i32>())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| {
+                        error_text(&ErrorCode::AreaInvalid.into(), self.settings.lang == "ja")
+                    })?;
+                Some(ClickArea::from_corners(
+                    (values[0], values[1]),
+                    (values[2], values[3]),
+                ))
+            } else {
+                return Err(error_text(
+                    &ErrorCode::AreaInvalid.into(),
+                    self.settings.lang == "ja",
+                ));
+            };
             let interval = model::parse_interval(&text(self.control(INTERVAL)))
                 .map_err(|e| error_text(&e, self.settings.lang == "ja"))?;
             let repeat = text(self.control(REPEAT))
@@ -430,10 +500,13 @@ impl App {
                     );
                 }
             }
-            self.settings.interval_ms = interval;
+            self.settings.interval_ticks = interval;
             self.settings.repeat = repeat;
+            self.settings.fast_interval_ticks = fast;
+            self.settings.area_step_px = step;
+            self.settings.area = region;
             for (p, ms) in self.settings.points.iter_mut().zip(overrides) {
-                p.interval_ms = Some(ms);
+                p.interval_ticks = Some(ms);
             }
             set_text(self.control(INTERVAL), &model::format_interval(interval));
         } else {
@@ -530,6 +603,9 @@ impl App {
         self.update_stats();
     }
     fn build_main(&mut self) {
+        self.main_offset = 0;
+        self.build_modes();
+        self.main_offset = 190;
         self.label_id(STATUS, "", 35, 112, 580, 28);
         self.label_id(CLICKS, "", 35, 150, 180, 30);
         self.label_id(CYCLES, "", 233, 150, 180, 30);
@@ -572,7 +648,7 @@ impl App {
         self.label(&caption, 30, 358, 240, 25);
         self.edit(
             INTERVAL,
-            &model::format_interval(self.settings.interval_ms),
+            &model::format_interval(self.settings.interval_ticks),
             320,
             353,
             160,
@@ -582,13 +658,24 @@ impl App {
         self.button(DEFAULT_INTERVAL, &reset, 490, 353, 126, 30);
         let helper = self
             .t(
-                "最小 0.001 秒・0.001 秒単位",
-                "Minimum 0.001 s • step 0.001 s",
+                "最小 0.0000001 秒・小数点以下7桁まで",
+                "Minimum 0.0000001 s • up to 7 decimal places",
             )
             .to_string();
         self.label(&helper, 30, 389, 560, 23);
         let repeat = self
-            .t("繰り返し回数（0 = 無限）", "Repeat cycles (0 = forever)")
+            .t(
+                if matches!(self.settings.mode, ClickMode::Pointer | ClickMode::Drag) {
+                    "連打は停止するまで継続"
+                } else {
+                    "繰り返し回数（0 = 無限）"
+                },
+                if matches!(self.settings.mode, ClickMode::Pointer | ClickMode::Drag) {
+                    "Rapid click runs until stopped"
+                } else {
+                    "Repeat cycles (0 = forever)"
+                },
+            )
             .to_string();
         self.label(&repeat, 30, 425, 280, 25);
         self.edit(
@@ -647,7 +734,9 @@ impl App {
                 self.label(&label, 40, y + 4, 270, 25);
                 self.edit(
                     INTERVAL_POINT + i as u16,
-                    &model::format_interval(p.interval_ms.unwrap_or(self.settings.interval_ms)),
+                    &model::format_interval(
+                        p.interval_ticks.unwrap_or(self.settings.interval_ticks),
+                    ),
                     320,
                     y,
                     160,
@@ -705,7 +794,7 @@ impl App {
         y += 13;
         let message = self.message.clone();
         self.label_id(MESSAGE, &message, 30, y, 585, 52);
-        self.content_height = y + 70;
+        self.content_height = y + 70 + self.main_offset;
         self.enable(RECORD, !self.busy());
         self.enable(RECORD_STOP, self.recording);
         self.enable(START, !self.busy() && self.hotkeys_ready);
@@ -713,8 +802,143 @@ impl App {
         for id in [INTERVAL, REPEAT, DEFAULT_INTERVAL, DETAILS, INDIVIDUAL] {
             self.enable(id, !self.busy());
         }
+        self.enable(
+            REPEAT,
+            !self.busy() && !matches!(self.settings.mode, ClickMode::Pointer | ClickMode::Drag),
+        );
+        self.enable(
+            INTERVAL,
+            !self.busy() && self.settings.mode == ClickMode::Recorded,
+        );
+        self.enable(
+            DEFAULT_INTERVAL,
+            !self.busy() && self.settings.mode == ClickMode::Recorded,
+        );
         self.enable(PREVIEW, !self.busy() && !self.settings.points.is_empty());
         self.enable(CLEAR, !self.busy() && !self.settings.points.is_empty());
+    }
+    fn build_modes(&mut self) {
+        let label = self.t("動作", "Mode").to_string();
+        self.label(&label, 30, 116, 100, 25);
+        let combo = self.create(
+            MODE,
+            w!("COMBOBOX"),
+            "",
+            WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
+            [130, 112, 485, 180],
+        );
+        let modes = if self.settings.lang == "ja" {
+            [
+                "記憶した位置",
+                "範囲内を均等にクリック",
+                "ポインタ位置で連打",
+                "ドラッグ中だけ連打",
+            ]
+        } else {
+            [
+                "Recorded positions",
+                "Evenly cover a region",
+                "Click at the pointer",
+                "Click only while dragging",
+            ]
+        };
+        for caption in modes {
+            unsafe {
+                SendMessageW(combo, CB_ADDSTRING, 0, wide(caption).as_ptr() as isize);
+            }
+        }
+        let mode = match self.settings.mode {
+            ClickMode::Recorded => 0,
+            ClickMode::Area => 1,
+            ClickMode::Pointer => 2,
+            ClickMode::Drag => 3,
+        };
+        unsafe {
+            SendMessageW(combo, CB_SETCURSEL, mode, 0);
+        }
+        // Combo drop-down height is larger than its collapsed layout rectangle.
+        if let Some(control) = self.controls.get_mut(&MODE) {
+            control.h = 180;
+        }
+        let select = self
+            .t("範囲を指定（2か所）", "Select region (2 corners)")
+            .to_string();
+        self.button(AREA_SELECT, &select, 30, 151, 240, 30);
+        let spacing = self.t("配置間隔 px", "Grid spacing px").to_string();
+        self.label(&spacing, 290, 155, 160, 25);
+        self.edit(
+            AREA_STEP,
+            &self.settings.area_step_px.to_string(),
+            470,
+            151,
+            145,
+            true,
+        );
+        let a = self.settings.area;
+        for (id, title, x, value) in [
+            (AREA_LEFT, "X1", 30, a.map(|a| a.left)),
+            (AREA_TOP, "Y1", 180, a.map(|a| a.top)),
+            (AREA_RIGHT, "X2", 330, a.map(|a| a.right)),
+            (AREA_BOTTOM, "Y2", 480, a.map(|a| a.bottom)),
+        ] {
+            self.label(title, x, 193, 32, 25);
+            self.edit(
+                id,
+                &value.map_or(String::new(), |v| v.to_string()),
+                x + 32,
+                187,
+                100,
+                false,
+            );
+        }
+        let fast = self
+            .t("連打間隔（秒）", "Rapid interval (seconds)")
+            .to_string();
+        self.label(&fast, 30, 232, 270, 25);
+        self.edit(
+            FAST_INTERVAL,
+            &model::format_interval(self.settings.fast_interval_ticks),
+            320,
+            226,
+            160,
+            false,
+        );
+        let locked = self.runner.as_ref().is_some_and(|r| r.snapshot().locked);
+        let caption = self.lock_caption(locked).to_string();
+        self.button(LOCK, &caption, 30, 265, 285, 30);
+        let hint = self
+            .t(
+                "停止: Ctrl+Alt+X（全モード共通）",
+                "Stop: Ctrl+Alt+X (all modes)",
+            )
+            .to_string();
+        self.label(&hint, 330, 270, 285, 25);
+        for id in [
+            MODE,
+            AREA_SELECT,
+            AREA_LEFT,
+            AREA_TOP,
+            AREA_RIGHT,
+            AREA_BOTTOM,
+            AREA_STEP,
+            FAST_INTERVAL,
+        ] {
+            self.enable(id, !self.busy());
+        }
+        self.enable(
+            LOCK,
+            self.hotkeys_ready
+                && !self.recording
+                && (self.runner.is_none() || self.settings.mode == ClickMode::Drag),
+        );
+    }
+    fn lock_caption(&self, locked: bool) -> &str {
+        match (self.lock_hotkey_ready, locked) {
+            (true, true) => self.t("ロック解除  Ctrl+Alt+L", "Unlock  Ctrl+Alt+L"),
+            (true, false) => self.t("連打ロック  Ctrl+Alt+L", "Lock rapid click  Ctrl+Alt+L"),
+            (false, true) => self.t("ロック解除（ボタンのみ）", "Unlock (button only)"),
+            (false, false) => self.t("連打ロック（ボタンのみ）", "Lock rapid click (button only)"),
+        }
     }
     fn build_settings(&mut self) {
         let behavior = self.t("動作", "Behavior").to_string();
@@ -874,7 +1098,27 @@ impl App {
                 self.t("秒", "sec")
             )
         } else if self.runner.is_some() {
-            self.t("自動クリック中", "Auto-clicking").to_string()
+            if self.last.locked {
+                if self.lock_hotkey_ready {
+                    self.t(
+                        "連打ロック中（Ctrl+Alt+Lで解除）",
+                        "Rapid click locked (Ctrl+Alt+L to unlock)",
+                    )
+                } else {
+                    self.t(
+                        "連打ロック中（ボタンで解除）",
+                        "Rapid click locked (use the button to unlock)",
+                    )
+                }
+            } else if self.last.waiting_for_drag {
+                self.t(
+                    "ドラッグ待機中：左ボタンを押して動かしてください",
+                    "Waiting: hold the left button and move to click",
+                )
+            } else {
+                self.t("自動クリック中", "Auto-clicking")
+            }
+            .to_string()
         } else {
             self.t("待機中", "Idle").to_string()
         };
@@ -887,6 +1131,10 @@ impl App {
             &format!("{:02}:{:02}", seconds / 60, seconds % 60),
         );
         set_text(self.control(MESSAGE), &self.message);
+        if self.runner.is_some() && self.settings.mode == ClickMode::Drag {
+            let label = self.lock_caption(self.last.locked);
+            set_text(self.control(LOCK), label);
+        }
     }
     fn clear_markers(&mut self) {
         for hwnd in self.markers.drain(..) {
@@ -949,13 +1197,52 @@ impl App {
         self.recorded.push(Point {
             x,
             y,
-            interval_ms: None,
+            interval_ticks: None,
         });
+        if self.selecting_area && self.recorded.len() == 2 {
+            self.settings.area = Some(ClickArea::from_corners(
+                (self.recorded[0].x, self.recorded[0].y),
+                (x, y),
+            ));
+            self.recording = false;
+            self.selecting_area = false;
+            self.recorded.clear();
+            if !self.mouse_hook.is_null() {
+                unsafe {
+                    UnhookWindowsHookEx(self.mouse_hook);
+                }
+                self.mouse_hook = null_mut();
+            }
+            self.clear_markers();
+            self.message = self.t("範囲を保存しました。", "Region saved.").into();
+            self.save();
+            self.rebuild();
+            return;
+        }
         let points = self.recorded.clone();
         self.show_markers(&points);
         self.rebuild();
     }
     fn action(&mut self, id: u16) {
+        if id == LOCK {
+            if self.recording || !self.hotkeys_ready {
+                return;
+            }
+            if let Some(runner) = &self.runner {
+                if self.settings.mode == ClickMode::Drag {
+                    runner.toggle_lock();
+                    self.update_stats();
+                }
+                return;
+            }
+            if !self.commit() {
+                return;
+            }
+            self.settings.mode = ClickMode::Drag;
+            self.save();
+            self.start_run(true);
+            return;
+        }
         if id == STOP {
             if let Some(mut r) = self.runner.take() {
                 r.stop();
@@ -964,6 +1251,9 @@ impl App {
                     .t("自動クリックを停止しました。", "Auto-clicking stopped.")
                     .into();
                 self.rebuild();
+            }
+            if self.recording {
+                self.action(RECORD_STOP);
             }
             return;
         }
@@ -977,7 +1267,13 @@ impl App {
                     self.mouse_hook = null_mut();
                 }
                 self.clear_markers();
-                if !self.recorded.is_empty() {
+                if self.selecting_area {
+                    self.selecting_area = false;
+                    self.recorded.clear();
+                    self.message = self
+                        .t("範囲指定を取り消しました。", "Region selection cancelled.")
+                        .into();
+                } else if !self.recorded.is_empty() {
                     self.settings.points = std::mem::take(&mut self.recorded);
                     self.message = self
                         .t("クリック位置を保存しました。", "Positions saved.")
@@ -1063,13 +1359,38 @@ impl App {
         if self.busy() {
             return;
         }
+        if id == MODE {
+            let selection = unsafe { SendMessageW(self.control(MODE), CB_GETCURSEL, 0, 0) };
+            if !self.commit() {
+                let previous = match self.settings.mode {
+                    ClickMode::Recorded => 0,
+                    ClickMode::Area => 1,
+                    ClickMode::Pointer => 2,
+                    ClickMode::Drag => 3,
+                };
+                unsafe {
+                    SendMessageW(self.control(MODE), CB_SETCURSEL, previous, 0);
+                }
+                return;
+            }
+            self.settings.mode = match selection {
+                1 => ClickMode::Area,
+                2 => ClickMode::Pointer,
+                3 => ClickMode::Drag,
+                _ => ClickMode::Recorded,
+            };
+            self.scroll = 0;
+            self.save();
+            self.rebuild();
+            return;
+        }
         if id == DEFAULT_INTERVAL {
-            let previous_common = self.settings.interval_ms;
-            self.settings.interval_ms = model::DEFAULT_INTERVAL_MS;
+            let previous_common = self.settings.interval_ticks;
+            self.settings.interval_ticks = model::DEFAULT_INTERVAL_TICKS;
             set_text(self.control(INTERVAL), "0.501");
             for (i, point) in self.settings.points.iter().enumerate() {
                 let editor = self.control(INTERVAL_POINT + i as u16);
-                if follows_common_interval(point.interval_ms, &text(editor), previous_common) {
+                if follows_common_interval(point.interval_ticks, &text(editor), previous_common) {
                     set_text(editor, "0.501");
                 }
             }
@@ -1083,7 +1404,7 @@ impl App {
         }
         self.cancel_capture();
         match id {
-            RECORD => {
+            RECORD | AREA_SELECT => {
                 self.mouse_hook = unsafe {
                     SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), GetModuleHandleW(null()), 0)
                 };
@@ -1099,8 +1420,20 @@ impl App {
                 }
                 self.clear_markers();
                 self.recorded.clear();
+                self.selecting_area = id == AREA_SELECT;
+                if self.selecting_area {
+                    self.settings.mode = ClickMode::Area;
+                    self.message = self
+                        .t(
+                            "範囲の2隅をクリックしてください。取消: Ctrl+Alt+X",
+                            "Click two opposite corners. Cancel: Ctrl+Alt+X",
+                        )
+                        .into();
+                }
                 self.recording = true;
-                self.message.clear();
+                if !self.selecting_area {
+                    self.message.clear();
+                }
                 self.rebuild();
             }
             START => {
@@ -1114,7 +1447,7 @@ impl App {
                     set_text(self.control(MESSAGE), &self.message);
                     return;
                 }
-                if self.settings.points.is_empty() {
+                if self.settings.mode == ClickMode::Recorded && self.settings.points.is_empty() {
                     self.message = self
                         .t(
                             "先にクリック位置を記憶してください。",
@@ -1124,19 +1457,7 @@ impl App {
                     set_text(self.control(MESSAGE), &self.message);
                     return;
                 }
-                self.clear_markers();
-                match Runner::start(self.settings.clone()) {
-                    Ok(runner) => {
-                        self.runner = Some(runner);
-                        self.last = Progress::default();
-                        self.message.clear();
-                        self.rebuild();
-                    }
-                    Err(e) => {
-                        self.message = error_text(&e, self.settings.lang == "ja");
-                        set_text(self.control(MESSAGE), &self.message);
-                    }
-                }
+                self.start_run(false);
             }
             DETAILS => {
                 self.settings.details_open = !self.settings.details_open;
@@ -1218,16 +1539,50 @@ impl App {
             _ => {}
         }
     }
+    fn start_run(&mut self, locked: bool) {
+        self.clear_markers();
+        self.cancel_capture();
+        match Runner::start(self.settings.clone()) {
+            Ok(runner) => {
+                if locked {
+                    runner.toggle_lock();
+                }
+                self.runner = Some(runner);
+                self.last = Progress::default();
+                self.message.clear();
+                self.rebuild();
+            }
+            Err(error) => {
+                self.message = error_text(&error, self.settings.lang == "ja");
+                self.rebuild();
+            }
+        }
+    }
     fn register_hotkeys(&mut self) -> Result<(), String> {
-        self.hotkeys_ready = false;
-        for i in 0..4 {
+        for i in 0..5 {
             unsafe {
                 UnregisterHotKey(self.hwnd, i + 1);
             }
         }
+        let hwnd = self.hwnd;
+        self.register_hotkeys_using(|id, mods, key| unsafe {
+            RegisterHotKey(hwnd, id, mods, key) != 0
+        })
+    }
+    fn register_hotkeys_using(
+        &mut self,
+        mut register: impl FnMut(i32, u32, u32) -> bool,
+    ) -> Result<(), String> {
+        self.hotkeys_ready = false;
+        self.lock_hotkey_ready = register(
+            LOCK_HOTKEY,
+            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+            b'L' as u32,
+        );
         for (i, action) in ACTIONS.iter().enumerate() {
             let Some((mods, key)) = parse_hotkey(&self.settings.hotkeys[*action]) else {
-                for id in 1..=4 {
+                self.lock_hotkey_ready = false;
+                for id in 1..=5 {
                     unsafe {
                         UnregisterHotKey(self.hwnd, id);
                     }
@@ -1238,8 +1593,9 @@ impl App {
                     self.settings.hotkeys[*action]
                 ));
             };
-            if unsafe { RegisterHotKey(self.hwnd, i as i32 + 1, mods | MOD_NOREPEAT, key) } == 0 {
-                for j in 0..i as i32 {
+            if !register(i as i32 + 1, mods | MOD_NOREPEAT, key) {
+                self.lock_hotkey_ready = false;
+                for j in 0..5 {
                     unsafe {
                         UnregisterHotKey(self.hwnd, j + 1);
                     }
@@ -1276,6 +1632,16 @@ impl App {
             self.rebuild();
             return;
         };
+        if mods == MOD_CONTROL | MOD_ALT && key == b'L' as u32 {
+            self.message = self
+                .t(
+                    "Ctrl+Alt+Lは連打ロック専用です。",
+                    "Ctrl+Alt+L is reserved for rapid click lock.",
+                )
+                .into();
+            self.rebuild();
+            return;
+        }
         if self
             .settings
             .hotkeys
@@ -1343,6 +1709,7 @@ fn wheel_steps(remainder: &mut i32, delta: i32) -> i32 {
 }
 fn repair_hotkeys(settings: &mut Settings) -> bool {
     let mut used = HashSet::new();
+    used.insert((MOD_CONTROL | MOD_ALT, b'L' as u32));
     let mut invalid = vec![];
     for action in ACTIONS {
         match settings.hotkeys.get(action).and_then(|v| parse_hotkey(v)) {
@@ -1758,13 +2125,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             WM_COMMAND => {
                 let id = (wp & 0xffff) as u16;
                 let notification = ((wp >> 16) & 0xffff) as u32;
-                if notification == BN_CLICKED {
+                if notification == BN_CLICKED || (id == MODE && notification == CBN_SELCHANGE) {
                     app.action(id);
                 }
                 true
             }
             WM_HOTKEY => {
                 if CAPTURE.load(Ordering::Relaxed) == 0 {
+                    if wp == LOCK_HOTKEY as usize {
+                        app.action(LOCK);
+                        return true;
+                    }
                     if let Some(action) =
                         [RECORD, RECORD_STOP, START, STOP].get(wp.saturating_sub(1))
                     {
@@ -2018,7 +2389,10 @@ pub fn run() {
             mouse_hook: null_mut(),
             capturing: None,
             hotkeys_ready: false,
+            lock_hotkey_ready: false,
             wheel_remainder: 0,
+            main_offset: 0,
+            selecting_area: false,
         };
         if migrated {
             app.message=app.t("旧設定とクリック位置を移行しました。間隔は0.501秒から開始します。","Previous positions and settings were imported. The interval starts at 0.501 seconds.").into();
@@ -2227,7 +2601,7 @@ pub fn input_probe(path: &str) {
                     .map(|(i, ms)| Point {
                         x: origin.x + 100 + i as i32 * 100,
                         y: origin.y + 160,
-                        interval_ms: Some(*ms),
+                        interval_ticks: Some(*ms * model::TICKS_PER_MILLISECOND),
                     })
                     .collect();
                 let settings = Settings {
@@ -2270,16 +2644,16 @@ pub fn input_probe(path: &str) {
                 } else {
                     deltas.iter().sum::<f64>() / deltas.len() as f64
                 };
-                scenarios.push(serde_json::json!({"scenario":name,"expected_clicks":expected,"received_clicks":events.len(),"count_ok":events.len()==expected,"positions_ok":positions_ok,"buttons_ok":buttons_ok,"reported_clicks":progress.clicks,"engine_elapsed_ms":progress.elapsed_ms,"mean_input_ms":progress.mean_input_ms,"error":progress.error,"mean_interval_ms":average,"p95_interval_ms":sorted.get(sorted.len()*95/100),"interval_sample_ms":deltas.iter().take(12).collect::<Vec<_>>()}));
+                scenarios.push(serde_json::json!({"scenario":name,"expected_clicks":expected,"received_clicks":events.len(),"count_ok":events.len()==expected,"positions_ok":positions_ok,"buttons_ok":buttons_ok,"reported_clicks":progress.clicks,"engine_elapsed_ms":progress.elapsed_ms,"mean_input_ms":progress.mean_input_ms,"error":progress.error,"mean_interval_ticks":average,"p95_interval_ticks":sorted.get(sorted.len()*95/100),"interval_sample_ms":deltas.iter().take(12).collect::<Vec<_>>()}));
             }
             PROBE.with(|e| e.borrow_mut().clear());
             let settings = Settings {
                 points: vec![Point {
                     x: origin.x + 100,
                     y: origin.y + 160,
-                    interval_ms: None,
+                    interval_ticks: None,
                 }],
-                interval_ms: 30_000,
+                interval_ticks: 300_000_000,
                 ..Settings::default()
             };
             let mut runner = Runner::start(settings).map_err(|e| e.to_string())?;
@@ -2317,11 +2691,205 @@ pub fn input_probe(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct TestApp {
+        app: App,
+        dir: PathBuf,
+    }
+    impl TestApp {
+        fn new() -> Self {
+            static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "clicker-ui-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let hwnd = unsafe {
+                let instance = GetModuleHandleW(null());
+                let class = WNDCLASSW {
+                    lpfnWndProc: Some(DefWindowProcW),
+                    hInstance: instance,
+                    lpszClassName: w!("ClickerControlTest"),
+                    ..zeroed()
+                };
+                RegisterClassW(&class);
+                CreateWindowExW(
+                    0,
+                    w!("ClickerControlTest"),
+                    w!("test"),
+                    WS_OVERLAPPEDWINDOW,
+                    0,
+                    0,
+                    800,
+                    1000,
+                    null_mut(),
+                    null_mut(),
+                    instance,
+                    null(),
+                )
+            };
+            assert!(!hwnd.is_null());
+            let (font, title_font) = make_fonts(1.);
+            let app = App {
+                hwnd,
+                settings: Settings::default(),
+                path: dir.join("settings.json"),
+                controls: BTreeMap::new(),
+                labels: vec![],
+                font,
+                title_font,
+                scale: 1.,
+                scroll: 0,
+                content_height: 1000,
+                tab: 0,
+                recording: false,
+                recorded: vec![],
+                runner: None,
+                last: Progress::default(),
+                markers: vec![],
+                message: String::new(),
+                saved_error: false,
+                keyboard_hook: null_mut(),
+                mouse_hook: null_mut(),
+                capturing: None,
+                hotkeys_ready: true,
+                lock_hotkey_ready: true,
+                wheel_remainder: 0,
+                main_offset: 0,
+                selecting_area: false,
+            };
+            let mut fixture = Self { app, dir };
+            fixture.app.rebuild();
+            fixture
+        }
+    }
+    impl Drop for TestApp {
+        fn drop(&mut self) {
+            unsafe {
+                DestroyWindow(self.app.hwnd);
+                DeleteObject(self.app.font);
+                DeleteObject(self.app.title_font);
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+    #[test]
+    fn native_mode_controls_parse_and_persist_without_desktop_input() {
+        let mut f = TestApp::new();
+        let a = &mut f.app;
+        unsafe {
+            SendMessageW(a.control(MODE), CB_SETCURSEL, 1, 0);
+        }
+        a.action(MODE);
+        assert_eq!(a.settings.mode, ClickMode::Area);
+        for (id, value) in [
+            (AREA_LEFT, "90"),
+            (AREA_TOP, "80"),
+            (AREA_RIGHT, "10"),
+            (AREA_BOTTOM, "20"),
+            (AREA_STEP, "17"),
+            (FAST_INTERVAL, "0.003"),
+        ] {
+            set_text(a.control(id), value);
+        }
+        assert!(a.commit());
+        assert_eq!(
+            a.settings.area,
+            Some(ClickArea {
+                left: 10,
+                top: 20,
+                right: 90,
+                bottom: 80
+            })
+        );
+        assert_eq!(a.settings.fast_interval_ticks, 30_000);
+        let (loaded, _) = Settings::load(&a.path).unwrap();
+        assert_eq!(loaded.mode, ClickMode::Area);
+        assert_eq!(loaded.area_step_px, 17);
+        unsafe {
+            SendMessageW(a.control(MODE), CB_SETCURSEL, 2, 0);
+        }
+        a.action(MODE);
+        assert_eq!(a.settings.mode, ClickMode::Pointer);
+        assert_eq!(unsafe { IsWindowEnabled(a.control(REPEAT)) }, 0);
+        assert_eq!(text(a.control(FAST_INTERVAL)), "0.003");
+        set_text(a.control(FAST_INTERVAL), "0.0000001");
+        assert!(a.commit());
+        assert_eq!(a.settings.fast_interval_ticks, 1);
+        let (back, _) = Settings::load(&a.path).unwrap();
+        assert_eq!(back.fast_interval_ticks, 1);
+        assert_eq!(text(a.control(FAST_INTERVAL)), "0.0000001");
+        let current = a.settings.area;
+        set_text(a.control(AREA_TOP), "bad");
+        assert!(!a.commit());
+        assert_eq!(a.settings.area, current);
+        unsafe {
+            SendMessageW(a.control(MODE), CB_SETCURSEL, 3, 0);
+        }
+        a.action(MODE);
+        assert_eq!(a.settings.mode, ClickMode::Pointer);
+        assert_eq!(
+            unsafe { SendMessageW(a.control(MODE), CB_GETCURSEL, 0, 0) },
+            2
+        );
+        assert_eq!(text(a.control(AREA_TOP)), "bad");
+    }
+    #[test]
+    fn lock_key_conflict_does_not_disable_start_and_stop() {
+        let mut f = TestApp::new();
+        let a = &mut f.app;
+        let mut ids = vec![];
+        assert!(
+            a.register_hotkeys_using(|id, _, _| {
+                ids.push(id);
+                id != LOCK_HOTKEY
+            })
+            .is_ok()
+        );
+        assert_eq!(ids, vec![5, 1, 2, 3, 4]);
+        assert!(a.hotkeys_ready);
+        assert!(!a.lock_hotkey_ready);
+        a.rebuild();
+        assert_ne!(unsafe { IsWindowEnabled(a.control(START)) }, 0);
+        assert!(text(a.control(LOCK)).contains("ボタン"));
+    }
+    #[test]
+    fn pending_point_intervals_survive_new_mode_switches() {
+        let mut f = TestApp::new();
+        let a = &mut f.app;
+        a.settings.points = vec![Point {
+            x: 1,
+            y: 2,
+            interval_ticks: None,
+        }];
+        a.settings.details_open = true;
+        a.settings.per_point = true;
+        a.rebuild();
+        set_text(a.control(INTERVAL_POINT), "0.011");
+        unsafe {
+            SendMessageW(a.control(MODE), CB_SETCURSEL, 3, 0);
+        }
+        a.action(MODE);
+        assert_eq!(a.settings.mode, ClickMode::Drag);
+        assert_eq!(a.settings.points[0].interval_ticks, Some(110_000));
+        assert_eq!(a.settings.interval_ticks, model::DEFAULT_INTERVAL_TICKS);
+        assert_eq!(a.settings.fast_interval_ticks, model::TICKS_PER_MILLISECOND);
+    }
+    #[test]
+    fn lock_key_is_reserved_when_migrating_previous_bindings() {
+        let mut s = Settings::default();
+        s.hotkeys.insert("click_start".into(), "ctrl+alt+l".into());
+        assert!(repair_hotkeys(&mut s));
+        assert_ne!(
+            parse_hotkey(&s.hotkeys["click_start"]),
+            Some((MOD_CONTROL | MOD_ALT, b'L' as u32))
+        );
+    }
     #[test]
     fn resetting_common_interval_preserves_pending_point_edits() {
-        assert!(follows_common_interval(None, "0.001", 1));
+        assert!(follows_common_interval(None, "0.0000001", 1));
         assert!(!follows_common_interval(None, "0.011", 1));
-        assert!(!follows_common_interval(Some(1), "0.001", 1));
+        assert!(!follows_common_interval(Some(1), "0.0000001", 1));
         assert!(!follows_common_interval(None, "invalid", 1));
     }
     #[test]
@@ -2340,7 +2908,7 @@ mod tests {
         let error = model::parse_interval("0.000").unwrap_err();
         assert_eq!(error.code, ErrorCode::IntervalRange);
         let english = error_text(&error, false);
-        assert!(english.contains("0.001"));
+        assert!(english.contains("0.0000001"));
         assert!(!english.contains("指定"));
         assert!(error_text(&error, true).contains("指定"));
     }

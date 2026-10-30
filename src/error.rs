@@ -2,6 +2,9 @@ use serde::Serialize;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum ErrorCode {
+    AreaMissing,
+    AreaInvalid,
+    InputMonitor,
     IntervalRange,
     IntervalFormat,
     PointLimit,

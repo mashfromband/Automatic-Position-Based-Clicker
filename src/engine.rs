@@ -1,5 +1,6 @@
+use crate::drag::{DragMonitor, DragState, point_hits_process};
 use crate::error::{ClickerError, ErrorCode};
-use crate::model::{Point, Settings};
+use crate::model::{ClickMode, Point, Settings};
 use serde::Serialize;
 use std::{
     mem::size_of,
@@ -28,6 +29,8 @@ pub struct Progress {
     pub running: bool,
     pub error: Option<ClickerError>,
     pub mean_input_ms: f64,
+    pub locked: bool,
+    pub waiting_for_drag: bool,
 }
 
 struct Handle(HANDLE);
@@ -139,6 +142,7 @@ struct Shared {
     running: AtomicBool,
     input_ns: AtomicU64,
     error: Mutex<Option<ClickerError>>,
+    wait_for_hotkey_release: AtomicBool,
 }
 pub struct Runner {
     signal: Arc<Signal>,
@@ -146,19 +150,60 @@ pub struct Runner {
     thread: Option<JoinHandle<()>>,
     started: Instant,
     delay_ms: u64,
+    drag_monitor: Option<DragMonitor>,
+    gate: Option<Arc<DragState>>,
 }
 impl Runner {
     pub fn start(settings: Settings) -> Result<Self, ClickerError> {
         settings.validate()?;
         let desktop = Desktop::current()?;
-        for point in &settings.points {
-            desktop.validate(point)?;
+        if settings.mode == ClickMode::Recorded {
+            for point in &settings.points {
+                desktop.validate(point)?;
+            }
         }
-        Self::with_emitter_mode(
+        if settings.mode == ClickMode::Area {
+            let a = settings.area.ok_or(ErrorCode::AreaMissing)?;
+            for (x, y) in [(a.left, a.top), (a.right, a.bottom)] {
+                desktop.validate(&Point {
+                    x,
+                    y,
+                    interval_ticks: None,
+                })?;
+            }
+        }
+        let drag_monitor = if settings.mode == ClickMode::Drag {
+            Some(DragMonitor::start(std::process::id())?)
+        } else {
+            None
+        };
+        let gate = drag_monitor.as_ref().map(|m| m.state.clone());
+        let mode = settings.mode;
+        let mut runner = Self::with_control(
             settings,
-            move |point, right| desktop.send(point, right),
+            move |point, right| {
+                if matches!(mode, ClickMode::Pointer | ClickMode::Drag) {
+                    desktop.send_at_cursor(right)
+                } else {
+                    if mode == ClickMode::Area
+                        && point_hits_process(
+                            POINT {
+                                x: point.x,
+                                y: point.y,
+                            },
+                            std::process::id(),
+                        )
+                    {
+                        return Ok(false);
+                    }
+                    desktop.send(point, right).map(|_| true)
+                }
+            },
             true,
-        )
+            gate,
+        )?;
+        runner.drag_monitor = drag_monitor;
+        Ok(runner)
     }
     #[cfg(test)]
     fn with_emitter<F>(settings: Settings, emit: F) -> Result<Self, ClickerError>
@@ -167,6 +212,7 @@ impl Runner {
     {
         Self::with_emitter_mode(settings, emit, false)
     }
+    #[cfg(test)]
     fn with_emitter_mode<F>(
         settings: Settings,
         mut emit: F,
@@ -175,10 +221,41 @@ impl Runner {
     where
         F: FnMut(&Point, bool) -> Result<(), ClickerError> + Send + 'static,
     {
+        Self::with_control(
+            settings,
+            move |p, right| {
+                emit(p, right)?;
+                Ok(true)
+            },
+            await_modifiers,
+            None,
+        )
+    }
+    fn with_control<F>(
+        settings: Settings,
+        mut emit: F,
+        await_modifiers: bool,
+        gate: Option<Arc<DragState>>,
+    ) -> Result<Self, ClickerError>
+    where
+        F: FnMut(&Point, bool) -> Result<bool, ClickerError> + Send + 'static,
+    {
         settings.validate()?;
-        if settings.points.is_empty() {
+        if settings.mode == ClickMode::Recorded && settings.points.is_empty() {
             return Err(ErrorCode::EmptyPoints.into());
         }
+        let points_per_cycle = match settings.mode {
+            ClickMode::Recorded => settings.points.len() as u64,
+            ClickMode::Area => {
+                let (x, y) = settings
+                    .area
+                    .ok_or(ErrorCode::AreaMissing)?
+                    .grid_size(settings.area_step_px)
+                    .ok_or(ErrorCode::AreaInvalid)?;
+                x * y
+            }
+            _ => 1,
+        };
         let signal = Arc::new(Signal::new()?);
         let waiter = Waiter::new(signal.clone())?;
         let shared = Arc::new(Shared {
@@ -188,11 +265,13 @@ impl Runner {
             running: AtomicBool::new(true),
             input_ns: AtomicU64::new(0),
             error: Mutex::new(None),
+            wait_for_hotkey_release: AtomicBool::new(false),
         });
         let started = Instant::now();
         let delay_ms = settings.delay_ms;
         let thread_shared = shared.clone();
         let thread_signal = signal.clone();
+        let thread_gate = gate.clone();
         let worker = thread::Builder::new()
             .name("click-timer".into())
             .spawn(move || {
@@ -217,31 +296,97 @@ impl Runner {
                         }
                     }
                     let mut cycles = 0u64;
+                    let mut index = 0u64;
                     'outer: loop {
-                        for (i, point) in settings.points.iter().enumerate() {
+                        {
                             if thread_signal.stopped() {
                                 break 'outer;
                             }
+                            if thread_gate
+                                .as_ref()
+                                .is_some_and(|g| g.input_failed.load(Ordering::Acquire))
+                            {
+                                return Err(ErrorCode::InputSend.into());
+                            }
+                            if await_modifiers
+                                && thread_shared
+                                    .wait_for_hotkey_release
+                                    .swap(false, Ordering::AcqRel)
+                                && [VK_CONTROL, VK_MENU]
+                                    .iter()
+                                    .any(|key| unsafe { GetAsyncKeyState(*key as i32) } < 0)
+                            {
+                                thread_shared
+                                    .wait_for_hotkey_release
+                                    .store(true, Ordering::Release);
+                                if !waiter.until(Instant::now() + Duration::from_millis(2))? {
+                                    break 'outer;
+                                }
+                                continue;
+                            }
+                            if thread_gate.as_ref().is_some_and(|g| !g.engaged()) {
+                                if !waiter.until(Instant::now() + Duration::from_millis(2))? {
+                                    break 'outer;
+                                }
+                                continue;
+                            }
+                            let point = match settings.mode {
+                                ClickMode::Recorded => settings.points[index as usize].clone(),
+                                ClickMode::Area => settings
+                                    .area
+                                    .and_then(|a| a.point_at(settings.area_step_px, index))
+                                    .ok_or(ErrorCode::AreaInvalid)?,
+                                _ => Point {
+                                    x: 0,
+                                    y: 0,
+                                    interval_ticks: None,
+                                },
+                            };
                             let sent_at = Instant::now();
-                            emit(point, settings.button == "right")?;
+                            if !emit(&point, settings.button == "right")? {
+                                if settings.mode == ClickMode::Area {
+                                    index += 1;
+                                    if index == points_per_cycle {
+                                        index = 0;
+                                        cycles += 1;
+                                        thread_shared.cycles.store(cycles, Ordering::Relaxed);
+                                        if settings.repeat != 0 && cycles >= settings.repeat as u64
+                                        {
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+                                if !waiter.until(Instant::now() + Duration::from_millis(2))? {
+                                    break 'outer;
+                                }
+                                continue;
+                            }
                             thread_shared.input_ns.fetch_add(
                                 sent_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                                 Ordering::Relaxed,
                             );
                             thread_shared.clicks.fetch_add(1, Ordering::Relaxed);
-                            let last = i + 1 == settings.points.len();
+                            let last = index + 1 == points_per_cycle;
                             if last {
                                 cycles += 1;
                                 thread_shared.cycles.store(cycles, Ordering::Relaxed);
                             }
-                            if last && settings.repeat != 0 && cycles >= settings.repeat as u64 {
+                            if last
+                                && matches!(settings.mode, ClickMode::Recorded | ClickMode::Area)
+                                && settings.repeat != 0
+                                && cycles >= settings.repeat as u64
+                            {
                                 break 'outer;
                             }
                             // Each deadline starts at this click, never at a stale global tick. Late
                             // scheduling therefore cannot accumulate a backlog of catch-up clicks.
-                            if !waiter
-                                .until(sent_at + Duration::from_millis(settings.interval_for(i)))?
-                            {
+                            let interval = if settings.mode == ClickMode::Recorded {
+                                settings.interval_for(index as usize)
+                            } else {
+                                settings.fast_interval_ticks
+                            };
+                            index = if last { 0 } else { index + 1 };
+                            if !waiter.until(sent_at + Duration::from_nanos(interval * 100))? {
                                 break 'outer;
                             }
                         }
@@ -274,6 +419,8 @@ impl Runner {
             thread: Some(worker),
             started,
             delay_ms,
+            drag_monitor: None,
+            gate,
         })
     }
     pub fn snapshot(&self) -> Progress {
@@ -297,12 +444,40 @@ impl Runner {
             mean_input_ms: self.shared.input_ns.load(Ordering::Relaxed) as f64
                 / self.shared.clicks.load(Ordering::Relaxed).max(1) as f64
                 / 1_000_000.,
+            locked: self
+                .gate
+                .as_ref()
+                .is_some_and(|g| g.locked.load(Ordering::Acquire)),
+            waiting_for_drag: self.gate.as_ref().is_some_and(|g| !g.engaged()),
         }
     }
     pub fn stop(&mut self) {
         self.signal.stop();
+        if let Some(gate) = &self.gate {
+            gate.cancel();
+        }
         if let Some(worker) = self.thread.take() {
             let _ = worker.join();
+        }
+        if let Some(mut monitor) = self.drag_monitor.take() {
+            monitor.stop();
+        }
+        if let Some(gate) = &self.gate {
+            gate.locked.store(false, Ordering::Release);
+            gate.active.store(false, Ordering::Release);
+        }
+    }
+    pub fn toggle_lock(&self) -> bool {
+        if self.finished() {
+            return false;
+        }
+        if let Some(gate) = &self.gate {
+            self.shared
+                .wait_for_hotkey_release
+                .store(true, Ordering::Release);
+            !gate.locked.fetch_xor(true, Ordering::AcqRel)
+        } else {
+            false
         }
     }
     pub fn finished(&self) -> bool {
@@ -323,6 +498,34 @@ struct Desktop {
     height: i32,
 }
 impl Desktop {
+    fn send_at_cursor(&self, right: bool) -> Result<bool, ClickerError> {
+        if Self::current()? != *self {
+            return Err(ErrorCode::ScreenChanged.into());
+        }
+        let mut point = POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut point) } == 0 {
+            return Err(os_error(ErrorCode::InputSend));
+        }
+        if point_hits_process(point, std::process::id()) {
+            return Ok(false);
+        }
+        self.validate(&Point {
+            x: point.x,
+            y: point.y,
+            interval_ticks: None,
+        })?;
+        // Button events carry no MOVE/ABSOLUTE flag: user motion remains untouched.
+        let events = pointer_inputs(right);
+        if unsafe { SendInput(2, events.as_ptr(), size_of::<INPUT>() as i32) } != 2 {
+            let err = os_error(ErrorCode::InputSend);
+            let release = pointer_inputs(right)[1];
+            unsafe {
+                SendInput(1, &release, size_of::<INPUT>() as i32);
+            }
+            return Err(err);
+        }
+        Ok(true)
+    }
     fn current() -> Result<Self, ClickerError> {
         let d = unsafe {
             Self {
@@ -409,13 +612,33 @@ impl Desktop {
         Ok(())
     }
 }
+pub(crate) fn pointer_inputs(right: bool) -> [INPUT; 2] {
+    let (down, up) = if right {
+        (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)
+    } else {
+        (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)
+    };
+    [down, up].map(|flags| INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    })
+}
 fn normalize(value: i32, origin: i32, size: i32) -> i32 {
     (((value as i64 - origin as i64) * 2 + 1) * 65536 / (size as i64 * 2)).clamp(0, 65535) as i32
 }
 
 #[derive(Debug, Serialize)]
 pub struct BenchmarkReport {
-    pub requested_interval_ms: u64,
+    pub requested_interval_ticks: u64,
     pub intervals: usize,
     pub high_resolution: bool,
     pub elapsed_ms: f64,
@@ -424,8 +647,12 @@ pub struct BenchmarkReport {
     pub p95_ms: f64,
     pub max_ms: f64,
 }
-pub fn benchmark(interval_ms: u64, count: usize) -> Result<BenchmarkReport, ClickerError> {
-    if interval_ms == 0 || interval_ms > 3_600_000 || count == 0 || count > 10_000 {
+pub fn benchmark(interval_ticks: u64, count: usize) -> Result<BenchmarkReport, ClickerError> {
+    if !(crate::model::MIN_INTERVAL_TICKS..=crate::model::MAX_INTERVAL_TICKS)
+        .contains(&interval_ticks)
+        || count == 0
+        || count > 10_000
+    {
         return Err(ErrorCode::BenchmarkRange.into());
     }
     let waiter = Waiter::new(Arc::new(Signal::new()?))?;
@@ -433,7 +660,7 @@ pub fn benchmark(interval_ms: u64, count: usize) -> Result<BenchmarkReport, Clic
     let mut previous = start;
     let mut measurements = Vec::with_capacity(count);
     for _ in 0..count {
-        waiter.until(previous + Duration::from_millis(interval_ms))?;
+        waiter.until(previous + Duration::from_nanos(interval_ticks * 100))?;
         let now = Instant::now();
         measurements.push(now.duration_since(previous).as_secs_f64() * 1000.);
         previous = now;
@@ -442,7 +669,7 @@ pub fn benchmark(interval_ms: u64, count: usize) -> Result<BenchmarkReport, Clic
     let mean_ms = measurements.iter().sum::<f64>() / count as f64;
     measurements.sort_by(|a, b| a.total_cmp(b));
     Ok(BenchmarkReport {
-        requested_interval_ms: interval_ms,
+        requested_interval_ticks: interval_ticks,
         intervals: count,
         high_resolution: waiter.high_resolution,
         elapsed_ms,
@@ -457,6 +684,148 @@ pub fn benchmark(interval_ms: u64, count: usize) -> Result<BenchmarkReport, Clic
 mod tests {
     use super::*;
     #[test]
+    fn area_visits_every_grid_location_without_a_large_point_buffer() {
+        let area = crate::model::ClickArea::from_corners((-4, -3), (4, 3));
+        let expected: Vec<_> = (0..9)
+            .map(|i| {
+                let p = area.point_at(4, i).unwrap();
+                (p.x, p.y)
+            })
+            .collect();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let copy = events.clone();
+        let mut runner = Runner::with_emitter_mode(
+            Settings {
+                mode: ClickMode::Area,
+                area: Some(area),
+                area_step_px: 4,
+                fast_interval_ticks: 1,
+                repeat: 2,
+                ..Settings::default()
+            },
+            move |p, _| {
+                copy.lock().unwrap().push((p.x, p.y));
+                Ok(())
+            },
+            false,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !runner.finished() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(runner.finished());
+        runner.stop();
+        let recorded = events.lock().unwrap();
+        assert_eq!(&recorded[..9], &expected);
+        assert_eq!(&recorded[9..], &expected);
+        assert_eq!(runner.snapshot().cycles, 2);
+        assert_eq!(runner.snapshot().clicks, 18);
+    }
+    #[test]
+    fn skipped_region_cells_advance_and_complete() {
+        let a = crate::model::ClickArea::from_corners((0, 0), (2, 2));
+        let mut runner = Runner::with_control(
+            Settings {
+                mode: ClickMode::Area,
+                area: Some(a),
+                area_step_px: 1,
+                fast_interval_ticks: 1,
+                repeat: 1,
+                ..Settings::default()
+            },
+            |_, _| Ok(false),
+            false,
+            None,
+        )
+        .unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        while !runner.finished() && Instant::now() < end {
+            thread::yield_now();
+        }
+        assert!(runner.finished());
+        runner.stop();
+        assert_eq!(runner.snapshot().cycles, 1);
+        assert_eq!(runner.snapshot().clicks, 0);
+    }
+    #[test]
+    fn drag_waits_without_input_lock_works_and_stop_remains_quiet() {
+        let gate = Arc::new(DragState::idle());
+        let control = gate.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (release, may_return) = std::sync::mpsc::sync_channel(0);
+        let mut first = true;
+        let mut runner = Runner::with_control(
+            Settings {
+                mode: ClickMode::Drag,
+                repeat: 1,
+                fast_interval_ticks: 1,
+                ..Settings::default()
+            },
+            move |_, _| {
+                let _ = tx.send(());
+                if first {
+                    first = false;
+                    may_return.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+                Ok(true)
+            },
+            false,
+            Some(gate),
+        )
+        .unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(30)).is_err());
+        assert!(runner.toggle_lock());
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!runner.toggle_lock());
+        release.send(()).unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(30)).is_err());
+        // Physical input can resume the worker without recreating it, after lock release.
+        control.active.store(true, Ordering::Release);
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        runner.stop();
+        let stopped = runner.snapshot().clicks;
+        assert!(runner.finished());
+        assert!(!runner.snapshot().locked);
+        assert!(!control.engaged());
+        assert!(!runner.toggle_lock());
+        assert_eq!(runner.snapshot().clicks, stopped);
+    }
+    #[test]
+    fn pointer_events_cannot_reposition_the_mouse() {
+        for right in [false, true] {
+            let events = pointer_inputs(right);
+            for e in events {
+                assert_eq!(e.r#type, INPUT_MOUSE);
+                let m = unsafe { e.Anonymous.mi };
+                assert_eq!(m.dx, 0);
+                assert_eq!(m.dy, 0);
+                assert_eq!(
+                    m.dwFlags & (MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK),
+                    0
+                );
+            }
+            let down = unsafe { events[0].Anonymous.mi.dwFlags };
+            let up = unsafe { events[1].Anonymous.mi.dwFlags };
+            assert_eq!(
+                down,
+                if right {
+                    MOUSEEVENTF_RIGHTDOWN
+                } else {
+                    MOUSEEVENTF_LEFTDOWN
+                }
+            );
+            assert_eq!(
+                up,
+                if right {
+                    MOUSEEVENTF_RIGHTUP
+                } else {
+                    MOUSEEVENTF_LEFTUP
+                }
+            );
+        }
+    }
+    #[test]
     fn normalized_coordinates_hit_pixel_centers_including_negative_monitors() {
         assert_eq!(normalize(-1920, -1920, 3840), 8);
         assert_eq!(normalize(1919, -1920, 3840), 65527);
@@ -468,17 +837,17 @@ mod tests {
             Point {
                 x: 1,
                 y: 0,
-                interval_ms: Some(1),
+                interval_ticks: Some(1),
             },
             Point {
                 x: 2,
                 y: 0,
-                interval_ms: Some(1),
+                interval_ticks: Some(1),
             },
             Point {
                 x: 3,
                 y: 0,
-                interval_ms: Some(30_000),
+                interval_ticks: Some(300_000_000),
             },
         ];
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -513,12 +882,12 @@ mod tests {
         let points = vec![Point {
             x: 0,
             y: 0,
-            interval_ms: None,
+            interval_ticks: None,
         }];
         let mut runner = Runner::with_emitter(
             Settings {
                 points,
-                interval_ms: 30_000,
+                interval_ticks: 300_000_000,
                 ..Settings::default()
             },
             move |_, _| {
@@ -544,7 +913,7 @@ mod tests {
                 points: vec![Point {
                     x: 0,
                     y: 0,
-                    interval_ms: None,
+                    interval_ticks: None,
                 }],
                 delay_ms: 30_000,
                 ..Settings::default()
@@ -569,7 +938,7 @@ mod tests {
                     points: vec![Point {
                         x: 0,
                         y: 0,
-                        interval_ms: None,
+                        interval_ticks: None,
                     }],
                     ..Settings::default()
                 },

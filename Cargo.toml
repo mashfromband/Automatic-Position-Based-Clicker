@@ -1,6 +1,6 @@
 [package]
 name = "multi-point-clicker"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A native Windows multi-point clicker with millisecond timing"
