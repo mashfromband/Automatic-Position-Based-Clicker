@@ -304,6 +304,16 @@ impl Runner {
                             if thread_signal.stopped() {
                                 break 'outer;
                             }
+                            if await_modifiers
+                                && [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
+                                    .iter()
+                                    .any(|key| unsafe { GetAsyncKeyState(*key as i32) } < 0)
+                            {
+                                if !waiter.until(Instant::now() + Duration::from_millis(2))? {
+                                    break 'outer;
+                                }
+                                continue;
+                            }
                             if thread_gate.as_ref().is_some_and(|g| !g.engaged()) {
                                 if !waiter.until(Instant::now() + Duration::from_millis(2))? {
                                     break 'outer;
@@ -445,6 +455,9 @@ impl Runner {
         }
     }
     pub fn toggle_lock(&self) -> bool {
+        if self.finished() {
+            return false;
+        }
         if let Some(gate) = &self.gate {
             !gate.locked.fetch_xor(true, Ordering::AcqRel)
         } else {
@@ -489,34 +502,11 @@ impl Desktop {
             y: point.y,
             interval_ms: None,
         })?;
-        let down = if right {
-            MOUSEEVENTF_RIGHTDOWN
-        } else {
-            MOUSEEVENTF_LEFTDOWN
-        };
-        let up = if right {
-            MOUSEEVENTF_RIGHTUP
-        } else {
-            MOUSEEVENTF_LEFTUP
-        };
-        let make = |flags| INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: 0,
-                    dy: 0,
-                    mouseData: 0,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        };
         // Button events carry no MOVE/ABSOLUTE flag: user motion remains untouched.
-        let events = [make(down), make(up)];
+        let events = pointer_inputs(right);
         if unsafe { SendInput(2, events.as_ptr(), size_of::<INPUT>() as i32) } != 2 {
             let err = os_error(ErrorCode::InputSend);
-            let release = make(up);
+            let release = pointer_inputs(right)[1];
             unsafe {
                 SendInput(1, &release, size_of::<INPUT>() as i32);
             }
@@ -609,6 +599,26 @@ impl Desktop {
         }
         Ok(())
     }
+}
+fn pointer_inputs(right: bool) -> [INPUT; 2] {
+    let (down, up) = if right {
+        (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)
+    } else {
+        (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)
+    };
+    [down, up].map(|flags| INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    })
 }
 fn normalize(value: i32, origin: i32, size: i32) -> i32 {
     (((value as i64 - origin as i64) * 2 + 1) * 65536 / (size as i64 * 2)).clamp(0, 65535) as i32
@@ -727,6 +737,8 @@ mod tests {
         let gate = Arc::new(DragState::idle());
         let control = gate.clone();
         let (tx, rx) = std::sync::mpsc::channel();
+        let (release, may_return) = std::sync::mpsc::sync_channel(0);
+        let mut first = true;
         let mut runner = Runner::with_control(
             Settings {
                 mode: ClickMode::Drag,
@@ -736,6 +748,10 @@ mod tests {
             },
             move |_, _| {
                 let _ = tx.send(());
+                if first {
+                    first = false;
+                    may_return.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
                 Ok(true)
             },
             false,
@@ -746,6 +762,8 @@ mod tests {
         assert!(runner.toggle_lock());
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(!runner.toggle_lock());
+        release.send(()).unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(30)).is_err());
         // Physical input can resume the worker without recreating it, after lock release.
         control.active.store(true, Ordering::Release);
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -754,7 +772,42 @@ mod tests {
         assert!(runner.finished());
         assert!(!runner.snapshot().locked);
         assert!(!control.engaged());
+        assert!(!runner.toggle_lock());
         assert_eq!(runner.snapshot().clicks, stopped);
+    }
+    #[test]
+    fn pointer_events_cannot_reposition_the_mouse() {
+        for right in [false, true] {
+            let events = pointer_inputs(right);
+            for e in events {
+                assert_eq!(e.r#type, INPUT_MOUSE);
+                let m = unsafe { e.Anonymous.mi };
+                assert_eq!(m.dx, 0);
+                assert_eq!(m.dy, 0);
+                assert_eq!(
+                    m.dwFlags & (MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK),
+                    0
+                );
+            }
+            let down = unsafe { events[0].Anonymous.mi.dwFlags };
+            let up = unsafe { events[1].Anonymous.mi.dwFlags };
+            assert_eq!(
+                down,
+                if right {
+                    MOUSEEVENTF_RIGHTDOWN
+                } else {
+                    MOUSEEVENTF_LEFTDOWN
+                }
+            );
+            assert_eq!(
+                up,
+                if right {
+                    MOUSEEVENTF_RIGHTUP
+                } else {
+                    MOUSEEVENTF_LEFTUP
+                }
+            );
+        }
     }
     #[test]
     fn normalized_coordinates_hit_pixel_centers_including_negative_monitors() {
