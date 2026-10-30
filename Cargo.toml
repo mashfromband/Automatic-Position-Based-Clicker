@@ -1,0 +1,36 @@
+[package]
+name = "multi-point-clicker"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A native Windows multi-point clicker with millisecond timing"
+
+[workspace]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[build-dependencies]
+embed-resource = "3.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm",
+    "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Security",
+    "Win32_System_Registry", "Win32_System_SystemInformation",
+    "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi", "Win32_UI_Controls", "Win32_Storage_FileSystem",
+    "Win32_Globalization"
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0

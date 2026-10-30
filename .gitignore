@@ -4,3 +4,7 @@ clicker_settings.json
 build/
 dist/
 *.spec
+target/
+.venv/
+*.lnk
+.godd/
