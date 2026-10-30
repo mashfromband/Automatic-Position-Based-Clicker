@@ -276,6 +276,7 @@ struct App {
     mouse_hook: HHOOK,
     capturing: Option<usize>,
     hotkeys_ready: bool,
+    lock_hotkey_ready: bool,
     wheel_remainder: i32,
     main_offset: i32,
     selecting_area: bool,
@@ -903,12 +904,7 @@ impl App {
             false,
         );
         let locked = self.runner.as_ref().is_some_and(|r| r.snapshot().locked);
-        let caption = if locked {
-            self.t("ロック解除  Ctrl+Alt+L", "Unlock  Ctrl+Alt+L")
-        } else {
-            self.t("連打ロック  Ctrl+Alt+L", "Lock rapid click  Ctrl+Alt+L")
-        }
-        .to_string();
+        let caption = self.lock_caption(locked).to_string();
         self.button(LOCK, &caption, 30, 265, 285, 30);
         let hint = self
             .t(
@@ -935,6 +931,14 @@ impl App {
                 && !self.recording
                 && (self.runner.is_none() || self.settings.mode == ClickMode::Drag),
         );
+    }
+    fn lock_caption(&self, locked: bool) -> &str {
+        match (self.lock_hotkey_ready, locked) {
+            (true, true) => self.t("ロック解除  Ctrl+Alt+L", "Unlock  Ctrl+Alt+L"),
+            (true, false) => self.t("連打ロック  Ctrl+Alt+L", "Lock rapid click  Ctrl+Alt+L"),
+            (false, true) => self.t("ロック解除（ボタンのみ）", "Unlock (button only)"),
+            (false, false) => self.t("連打ロック（ボタンのみ）", "Lock rapid click (button only)"),
+        }
     }
     fn build_settings(&mut self) {
         let behavior = self.t("動作", "Behavior").to_string();
@@ -1095,10 +1099,17 @@ impl App {
             )
         } else if self.runner.is_some() {
             if self.last.locked {
-                self.t(
-                    "連打ロック中（Ctrl+Alt+Lで解除）",
-                    "Rapid click locked (Ctrl+Alt+L to unlock)",
-                )
+                if self.lock_hotkey_ready {
+                    self.t(
+                        "連打ロック中（Ctrl+Alt+Lで解除）",
+                        "Rapid click locked (Ctrl+Alt+L to unlock)",
+                    )
+                } else {
+                    self.t(
+                        "連打ロック中（ボタンで解除）",
+                        "Rapid click locked (use the button to unlock)",
+                    )
+                }
             } else if self.last.waiting_for_drag {
                 self.t(
                     "ドラッグ待機中：左ボタンを押して動かしてください",
@@ -1121,11 +1132,7 @@ impl App {
         );
         set_text(self.control(MESSAGE), &self.message);
         if self.runner.is_some() && self.settings.mode == ClickMode::Drag {
-            let label = if self.last.locked {
-                self.t("ロック解除  Ctrl+Alt+L", "Unlock  Ctrl+Alt+L")
-            } else {
-                self.t("連打ロック  Ctrl+Alt+L", "Lock rapid click  Ctrl+Alt+L")
-            };
+            let label = self.lock_caption(self.last.locked);
             set_text(self.control(LOCK), label);
         }
     }
@@ -1355,7 +1362,15 @@ impl App {
         if id == MODE {
             let selection = unsafe { SendMessageW(self.control(MODE), CB_GETCURSEL, 0, 0) };
             if !self.commit() {
-                self.rebuild();
+                let previous = match self.settings.mode {
+                    ClickMode::Recorded => 0,
+                    ClickMode::Area => 1,
+                    ClickMode::Pointer => 2,
+                    ClickMode::Drag => 3,
+                };
+                unsafe {
+                    SendMessageW(self.control(MODE), CB_SETCURSEL, previous, 0);
+                }
                 return;
             }
             self.settings.mode = match selection {
@@ -1544,30 +1559,29 @@ impl App {
         }
     }
     fn register_hotkeys(&mut self) -> Result<(), String> {
-        self.hotkeys_ready = false;
         for i in 0..5 {
             unsafe {
                 UnregisterHotKey(self.hwnd, i + 1);
             }
         }
-        if unsafe {
-            RegisterHotKey(
-                self.hwnd,
-                LOCK_HOTKEY,
-                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
-                b'L' as u32,
-            )
-        } == 0
-        {
-            return Err(self
-                .t(
-                    "ロックキーCtrl+Alt+Lを登録できません。",
-                    "Cannot register Ctrl+Alt+L for rapid click lock.",
-                )
-                .into());
-        }
+        let hwnd = self.hwnd;
+        self.register_hotkeys_using(|id, mods, key| unsafe {
+            RegisterHotKey(hwnd, id, mods, key) != 0
+        })
+    }
+    fn register_hotkeys_using(
+        &mut self,
+        mut register: impl FnMut(i32, u32, u32) -> bool,
+    ) -> Result<(), String> {
+        self.hotkeys_ready = false;
+        self.lock_hotkey_ready = register(
+            LOCK_HOTKEY,
+            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+            b'L' as u32,
+        );
         for (i, action) in ACTIONS.iter().enumerate() {
             let Some((mods, key)) = parse_hotkey(&self.settings.hotkeys[*action]) else {
+                self.lock_hotkey_ready = false;
                 for id in 1..=5 {
                     unsafe {
                         UnregisterHotKey(self.hwnd, id);
@@ -1579,7 +1593,8 @@ impl App {
                     self.settings.hotkeys[*action]
                 ));
             };
-            if unsafe { RegisterHotKey(self.hwnd, i as i32 + 1, mods | MOD_NOREPEAT, key) } == 0 {
+            if !register(i as i32 + 1, mods | MOD_NOREPEAT, key) {
+                self.lock_hotkey_ready = false;
                 for j in 0..5 {
                     unsafe {
                         UnregisterHotKey(self.hwnd, j + 1);
@@ -2374,6 +2389,7 @@ pub fn run() {
             mouse_hook: null_mut(),
             capturing: None,
             hotkeys_ready: false,
+            lock_hotkey_ready: false,
             wheel_remainder: 0,
             main_offset: 0,
             selecting_area: false,
@@ -2737,6 +2753,7 @@ mod tests {
                 mouse_hook: null_mut(),
                 capturing: None,
                 hotkeys_ready: true,
+                lock_hotkey_ready: true,
                 wheel_remainder: 0,
                 main_offset: 0,
                 selecting_area: false,
@@ -2806,6 +2823,35 @@ mod tests {
         set_text(a.control(AREA_TOP), "bad");
         assert!(!a.commit());
         assert_eq!(a.settings.area, current);
+        unsafe {
+            SendMessageW(a.control(MODE), CB_SETCURSEL, 3, 0);
+        }
+        a.action(MODE);
+        assert_eq!(a.settings.mode, ClickMode::Pointer);
+        assert_eq!(
+            unsafe { SendMessageW(a.control(MODE), CB_GETCURSEL, 0, 0) },
+            2
+        );
+        assert_eq!(text(a.control(AREA_TOP)), "bad");
+    }
+    #[test]
+    fn lock_key_conflict_does_not_disable_start_and_stop() {
+        let mut f = TestApp::new();
+        let a = &mut f.app;
+        let mut ids = vec![];
+        assert!(
+            a.register_hotkeys_using(|id, _, _| {
+                ids.push(id);
+                id != LOCK_HOTKEY
+            })
+            .is_ok()
+        );
+        assert_eq!(ids, vec![5, 1, 2, 3, 4]);
+        assert!(a.hotkeys_ready);
+        assert!(!a.lock_hotkey_ready);
+        a.rebuild();
+        assert_ne!(unsafe { IsWindowEnabled(a.control(START)) }, 0);
+        assert!(text(a.control(LOCK)).contains("ボタン"));
     }
     #[test]
     fn pending_point_intervals_survive_new_mode_switches() {

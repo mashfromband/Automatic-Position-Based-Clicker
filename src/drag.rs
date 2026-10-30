@@ -12,8 +12,9 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
-    UI::WindowsAndMessaging::*,
+    UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
+const REPLAY_TAP: u32 = WM_APP + 20;
 
 #[derive(Default)]
 pub(crate) struct Gesture {
@@ -21,6 +22,9 @@ pub(crate) struct Gesture {
     pub active: bool,
 }
 impl Gesture {
+    fn ends_tap(&self, message: u32) -> bool {
+        message == WM_LBUTTONUP && self.held() && !self.active
+    }
     fn event(&mut self, message: u32, x: i32, y: i32, injected: bool, excluded: bool) -> bool {
         if injected {
             return false;
@@ -67,6 +71,7 @@ pub struct DragState {
     pub active: AtomicBool,
     pub locked: AtomicBool,
     stopping: AtomicBool,
+    pub input_failed: AtomicBool,
 }
 impl DragState {
     pub fn idle() -> Self {
@@ -74,10 +79,17 @@ impl DragState {
             active: AtomicBool::new(false),
             locked: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
+            input_failed: AtomicBool::new(false),
         }
     }
     pub fn engaged(&self) -> bool {
-        self.active.load(Ordering::Acquire) || self.locked.load(Ordering::Acquire)
+        !self.stopping.load(Ordering::Acquire)
+            && (self.active.load(Ordering::Acquire) || self.locked.load(Ordering::Acquire))
+    }
+    pub fn cancel(&self) {
+        self.stopping.store(true, Ordering::Release);
+        self.active.store(false, Ordering::Release);
+        self.locked.store(false, Ordering::Release);
     }
 }
 struct Context {
@@ -132,16 +144,27 @@ unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                 if ctx.state.stopping.load(Ordering::Acquire) {
                     return false;
                 }
-                let suppress = ctx.gesture.event(
-                    wp as u32,
-                    event.pt.x,
-                    event.pt.y,
-                    false,
-                    point_hits_process(event.pt, ctx.excluded_pid),
-                );
+                let tap =
+                    ctx.gesture.ends_tap(wp as u32) && !ctx.state.locked.load(Ordering::Acquire);
+                // Geometry is needed only for the start of a physical press.
+                let excluded =
+                    wp as u32 == WM_LBUTTONDOWN && point_hits_process(event.pt, ctx.excluded_pid);
+                let suppress = ctx
+                    .gesture
+                    .event(wp as u32, event.pt.x, event.pt.y, false, excluded);
                 ctx.state
                     .active
                     .store(ctx.gesture.active, Ordering::Release);
+                if tap {
+                    unsafe {
+                        PostThreadMessageW(
+                            GetCurrentThreadId(),
+                            REPLAY_TAP,
+                            event.pt.x as usize,
+                            event.pt.y as isize,
+                        );
+                    }
+                }
                 suppress
             });
             if suppress {
@@ -187,6 +210,33 @@ impl DragMonitor {
                 }
                 let _ = sender.send(Ok(GetCurrentThreadId()));
                 while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+                    if msg.message == REPLAY_TAP {
+                        if !copy.stopping.load(Ordering::Acquire)
+                            && !copy.locked.load(Ordering::Acquire)
+                        {
+                            let mut current: POINT = std::mem::zeroed();
+                            // A tap is replayed only while the cursor is still at its release
+                            // position. Never move it back or click an unrelated new location.
+                            if GetCursorPos(&mut current) != 0
+                                && current.x == msg.wParam as i32
+                                && current.y == msg.lParam as i32
+                                && !point_hits_process(current, excluded_pid)
+                            {
+                                let events = crate::engine::pointer_inputs(false);
+                                if SendInput(
+                                    2,
+                                    events.as_ptr(),
+                                    std::mem::size_of::<INPUT>() as i32,
+                                ) != 2
+                                {
+                                    let up = events[1];
+                                    SendInput(1, &up, std::mem::size_of::<INPUT>() as i32);
+                                    copy.input_failed.store(true, Ordering::Release);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
@@ -217,9 +267,7 @@ impl DragMonitor {
         })
     }
     pub fn stop(&mut self) {
-        self.state.stopping.store(true, Ordering::Release);
-        self.state.locked.store(false, Ordering::Release);
-        self.state.active.store(false, Ordering::Release);
+        self.state.cancel();
         if let Some(thread) = self.thread.take() {
             unsafe {
                 PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0);
@@ -271,11 +319,7 @@ mod tests {
     }
     #[test]
     fn lock_is_separate_from_drag_and_never_starts_on_creation() {
-        let state = DragState {
-            active: AtomicBool::new(false),
-            locked: AtomicBool::new(false),
-            stopping: AtomicBool::new(false),
-        };
+        let state = DragState::idle();
         assert!(!state.engaged());
         state.locked.store(true, Ordering::Release);
         assert!(state.engaged());
@@ -283,5 +327,17 @@ mod tests {
         assert!(!state.engaged());
         state.active.store(true, Ordering::Release);
         assert!(state.engaged());
+    }
+    #[test]
+    fn ordinary_taps_are_distinct_from_drag_release() {
+        let mut g = Gesture::default();
+        assert!(!g.ends_tap(WM_LBUTTONUP));
+        g.event(WM_LBUTTONDOWN, 10, 10, false, false);
+        assert!(g.ends_tap(WM_LBUTTONUP));
+        g.event(WM_LBUTTONUP, 10, 10, false, false);
+        assert!(!g.ends_tap(WM_LBUTTONUP));
+        g.event(WM_LBUTTONDOWN, 10, 10, false, false);
+        g.event(WM_MOUSEMOVE, 30, 10, false, false);
+        assert!(!g.ends_tap(WM_LBUTTONUP));
     }
 }

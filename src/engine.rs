@@ -142,6 +142,7 @@ struct Shared {
     running: AtomicBool,
     input_ns: AtomicU64,
     error: Mutex<Option<ClickerError>>,
+    wait_for_hotkey_release: AtomicBool,
 }
 pub struct Runner {
     signal: Arc<Signal>,
@@ -264,6 +265,7 @@ impl Runner {
             running: AtomicBool::new(true),
             input_ns: AtomicU64::new(0),
             error: Mutex::new(None),
+            wait_for_hotkey_release: AtomicBool::new(false),
         });
         let started = Instant::now();
         let delay_ms = settings.delay_ms;
@@ -300,11 +302,23 @@ impl Runner {
                             if thread_signal.stopped() {
                                 break 'outer;
                             }
+                            if thread_gate
+                                .as_ref()
+                                .is_some_and(|g| g.input_failed.load(Ordering::Acquire))
+                            {
+                                return Err(ErrorCode::InputSend.into());
+                            }
                             if await_modifiers
+                                && thread_shared
+                                    .wait_for_hotkey_release
+                                    .swap(false, Ordering::AcqRel)
                                 && [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
                                     .iter()
                                     .any(|key| unsafe { GetAsyncKeyState(*key as i32) } < 0)
                             {
+                                thread_shared
+                                    .wait_for_hotkey_release
+                                    .store(true, Ordering::Release);
                                 if !waiter.until(Instant::now() + Duration::from_millis(2))? {
                                     break 'outer;
                                 }
@@ -439,6 +453,9 @@ impl Runner {
     }
     pub fn stop(&mut self) {
         self.signal.stop();
+        if let Some(gate) = &self.gate {
+            gate.cancel();
+        }
         if let Some(worker) = self.thread.take() {
             let _ = worker.join();
         }
@@ -455,6 +472,9 @@ impl Runner {
             return false;
         }
         if let Some(gate) = &self.gate {
+            self.shared
+                .wait_for_hotkey_release
+                .store(true, Ordering::Release);
             !gate.locked.fetch_xor(true, Ordering::AcqRel)
         } else {
             false
@@ -592,7 +612,7 @@ impl Desktop {
         Ok(())
     }
 }
-fn pointer_inputs(right: bool) -> [INPUT; 2] {
+pub(crate) fn pointer_inputs(right: bool) -> [INPUT; 2] {
     let (down, up) = if right {
         (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)
     } else {
