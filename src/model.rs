@@ -12,6 +12,66 @@ pub const DEFAULT_INTERVAL_MS: u64 = 501;
 pub const MAX_POINTS: usize = 10;
 pub const ACTIONS: [&str; 4] = ["record_start", "record_stop", "click_start", "click_stop"];
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClickMode {
+    #[default]
+    Recorded,
+    Area,
+    Pointer,
+    Drag,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClickArea {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+impl ClickArea {
+    pub fn from_corners(a: (i32, i32), b: (i32, i32)) -> Self {
+        Self {
+            left: a.0.min(b.0),
+            top: a.1.min(b.1),
+            right: a.0.max(b.0),
+            bottom: a.1.max(b.1),
+        }
+    }
+    pub fn grid_size(&self, step: u32) -> Option<(u64, u64)> {
+        if step == 0 || self.left > self.right || self.top > self.bottom {
+            return None;
+        }
+        let axis = |a: i32, b: i32| {
+            let span = (i64::from(b) - i64::from(a)) as u64;
+            span.div_ceil(step as u64) + 1
+        };
+        let size = (axis(self.left, self.right), axis(self.top, self.bottom));
+        size.0.checked_mul(size.1)?;
+        Some(size)
+    }
+    /// Serpentine grid; every coordinate is visited once, including all four edges.
+    pub fn point_at(&self, step: u32, index: u64) -> Option<Point> {
+        let (columns, rows) = self.grid_size(step)?;
+        let index = index % (columns * rows);
+        let row = index / columns;
+        let column = if row % 2 == 0 {
+            index % columns
+        } else {
+            columns - 1 - index % columns
+        };
+        let x = (i64::from(self.left) + (column * step as u64) as i64).min(i64::from(self.right))
+            as i32;
+        let y =
+            (i64::from(self.top) + (row * step as u64) as i64).min(i64::from(self.bottom)) as i32;
+        Some(Point {
+            x,
+            y,
+            interval_ms: None,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Point {
     pub x: i32,
@@ -35,6 +95,10 @@ pub struct Settings {
     pub hotkeys: BTreeMap<String, String>,
     pub per_point: bool,
     pub details_open: bool,
+    pub mode: ClickMode,
+    pub area: Option<ClickArea>,
+    pub area_step_px: u32,
+    pub fast_interval_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -89,6 +153,10 @@ impl Default for Settings {
             hotkeys: default_hotkeys(),
             per_point: false,
             details_open: false,
+            mode: ClickMode::Recorded,
+            area: None,
+            area_step_px: 30,
+            fast_interval_ms: 1,
         }
     }
 }
@@ -106,6 +174,18 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<(), ClickerError> {
+        if !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&self.fast_interval_ms) {
+            return Err(ErrorCode::IntervalRange.into());
+        }
+        if !(1..=4096).contains(&self.area_step_px) {
+            return Err(ErrorCode::AreaInvalid.into());
+        }
+        if self
+            .area
+            .is_some_and(|a| a.grid_size(self.area_step_px).is_none())
+        {
+            return Err(ErrorCode::AreaInvalid.into());
+        }
         if !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&self.interval_ms) {
             return Err(ErrorCode::IntervalRange.into());
         }
@@ -307,6 +387,58 @@ pub fn format_interval(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn grid_is_even_serpentine_and_includes_edges() {
+        let a = ClickArea::from_corners((9, 8), (-2, -3));
+        assert_eq!(a.grid_size(5), Some((4, 4)));
+        let points: Vec<_> = (0..16)
+            .map(|i| {
+                let p = a.point_at(5, i).unwrap();
+                assert!((-2..=9).contains(&p.x) && (-3..=8).contains(&p.y));
+                (p.x, p.y)
+            })
+            .collect();
+        assert_eq!(&points[..4], &[(-2, -3), (3, -3), (8, -3), (9, -3)]);
+        assert_eq!(&points[4..8], &[(9, 2), (8, 2), (3, 2), (-2, 2)]);
+        assert!(points.contains(&(9, 8)));
+        assert_eq!(
+            points
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            16
+        );
+        assert_eq!(a.point_at(5, 16), a.point_at(5, 0));
+        assert!(a.grid_size(0).is_none());
+    }
+    #[test]
+    fn grids_handle_single_pixels_large_extents_and_overflow() {
+        let one = ClickArea::from_corners((-2, -8), (-2, -8));
+        assert_eq!(one.grid_size(30), Some((1, 1)));
+        assert_eq!(one.point_at(30, 999).unwrap().x, -2);
+        let full = ClickArea::from_corners((i32::MIN, i32::MIN), (i32::MAX, i32::MAX));
+        assert!(full.grid_size(1).is_none());
+        assert!(full.grid_size(30).is_some());
+        let a = ClickArea::from_corners((0, 0), (1, 1));
+        assert_eq!(a.grid_size(4096), Some((2, 2)));
+    }
+    #[test]
+    fn old_rust_settings_default_to_recorded_and_fast_modes_round_trip() {
+        let s: Settings =
+            serde_json::from_str(r#"{"version":2,"points":[],"interval_ms":501}"#).unwrap();
+        assert_eq!(s.mode, ClickMode::Recorded);
+        assert_eq!(s.fast_interval_ms, 1);
+        let area = ClickArea::from_corners((50, 60), (5, 8));
+        let changed = Settings {
+            mode: ClickMode::Area,
+            area: Some(area),
+            ..s
+        };
+        let saved = serde_json::to_string(&changed).unwrap();
+        let back: Settings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(back.area, Some(area));
+        assert_eq!(back.mode, ClickMode::Area);
+    }
     #[test]
     fn decimal_boundaries_are_exact() {
         for (input, ms) in [
