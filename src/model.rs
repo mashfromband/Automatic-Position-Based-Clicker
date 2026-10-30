@@ -156,7 +156,7 @@ impl Settings {
             if !old.interval.is_finite() || !(0.001..=3600.).contains(&old.interval) {
                 return Err(ErrorCode::Config.into());
             }
-            // The owner requested 0.501 seconds for the first Rust launch, including migration.
+            // Migration uses the new interval default and retains the other settings.
             Self {
                 lang: old.lang,
                 theme: old.theme,

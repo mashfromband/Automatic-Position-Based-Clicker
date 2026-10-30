@@ -1064,11 +1064,13 @@ impl App {
             return;
         }
         if id == DEFAULT_INTERVAL {
+            let previous_common = self.settings.interval_ms;
             self.settings.interval_ms = model::DEFAULT_INTERVAL_MS;
             set_text(self.control(INTERVAL), "0.501");
             for (i, point) in self.settings.points.iter().enumerate() {
-                if point.interval_ms.is_none() {
-                    set_text(self.control(INTERVAL_POINT + i as u16), "0.501");
+                let editor = self.control(INTERVAL_POINT + i as u16);
+                if follows_common_interval(point.interval_ms, &text(editor), previous_common) {
+                    set_text(editor, "0.501");
                 }
             }
             self.message.clear();
@@ -1331,6 +1333,9 @@ impl App {
     }
 }
 
+fn follows_common_interval(saved: Option<u64>, editor: &str, common: u64) -> bool {
+    saved.is_none() && editor == model::format_interval(common)
+}
 fn wheel_steps(remainder: &mut i32, delta: i32) -> i32 {
     let total = *remainder + delta;
     *remainder = total % 120;
@@ -2020,7 +2025,7 @@ pub fn run() {
             app.save();
         }
         if repair_hotkeys(&mut app.settings) {
-            app.message=app.t("未対応または重複した旧キーを利用可能な初期キーに変更しました。設定で確認できます。","Unsupported or duplicate legacy hotkeys were reset to available defaults. Check Settings.").into();
+            app.message=if migrated {app.t("クリック位置と旧設定を移行し、未対応または重複したキーを修正しました（間隔は0.501秒から開始します）。","Imported positions and settings, repaired unsupported or duplicate hotkeys, and set the interval to 0.501 seconds.")}else{app.t("未対応または重複した旧キーを利用可能な初期キーに変更しました。設定で確認できます。","Unsupported or duplicate legacy hotkeys were reset to available defaults. Check Settings.")}.into();
             app.save();
         }
         if let Err(e) = app.register_hotkeys() {
@@ -2312,6 +2317,13 @@ pub fn input_probe(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resetting_common_interval_preserves_pending_point_edits() {
+        assert!(follows_common_interval(None, "0.001", 1));
+        assert!(!follows_common_interval(None, "0.011", 1));
+        assert!(!follows_common_interval(Some(1), "0.001", 1));
+        assert!(!follows_common_interval(None, "invalid", 1));
+    }
     #[test]
     fn high_resolution_wheel_accumulates_small_deltas() {
         let mut rest = 0;

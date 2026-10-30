@@ -2,7 +2,7 @@
 
 ## 自動テスト
 
-`cargo nextest run --locked --workspace` で16件が成功した。
+レビュー後に16件が成功し、共通間隔を戻す操作で編集中の個別値を保持する検査を加えた17件を含む。
 間隔の最小値/初期値/上限・不正値、個別間隔と位置の対応、旧設定の保全と移行、壊れた設定の保護、座標変換、有限周回の終了、長い間隔と開始待機中の停止、入力失敗/panicの通知、キーの変換を確認した。
 `cargo clippy --locked --all-targets -- -D warnings` と `cargo fmt --all -- --check` も確認する。
 doctestの対象は0件だった。
