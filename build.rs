@@ -4,7 +4,7 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         embed_resource::compile_for(
             "assets/windows.rc",
-            ["multi-point-clicker"],
+            ["multi-point-clicker", "clicker-launcher"],
             embed_resource::NONE,
         )
         .manifest_required()

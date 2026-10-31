@@ -25,6 +25,7 @@ use windows_sys::{
 const APP_RECORD: u32 = WM_APP + 1;
 const APP_CAPTURE: u32 = WM_APP + 2;
 const APP_INIT: u32 = WM_APP + 3;
+const APP_READY: u32 = WM_APP + 4;
 const STATIC_LEFT: u32 = 0; // SS_LEFT (the default STATIC control alignment).
 const TICK: usize = 1;
 const PREVIEW_TIMER: usize = 2;
@@ -2152,6 +2153,20 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 }
                 true
             }
+            APP_READY => {
+                if app.saved_error
+                    || app
+                        .controls
+                        .get(&START)
+                        .is_none_or(|h| unsafe { IsWindow(h.hwnd) } == 0)
+                    || multi_point_clicker::startup::notify_ready().is_err()
+                {
+                    unsafe {
+                        PostQuitMessage(1);
+                    }
+                }
+                true
+            }
             WM_SIZE => {
                 app.position_controls();
                 true
@@ -2246,7 +2261,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
-pub fn run() {
+fn startup_error(message: &str) {
+    if !multi_point_clicker::startup::managed() {
+        error_dialog(null_mut(), message);
+    }
+}
+
+pub fn run() -> i32 {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let instance = GetModuleHandleW(null());
@@ -2254,15 +2275,12 @@ pub fn run() {
         if mutex.is_null() {
             let japanese =
                 windows_sys::Win32::Globalization::GetUserDefaultUILanguage() & 0x3ff == 0x11;
-            error_dialog(
-                null_mut(),
-                if japanese {
-                    "アプリの起動ロックを作成できません。"
-                } else {
-                    "Cannot create the startup lock."
-                },
-            );
-            return;
+            startup_error(if japanese {
+                "アプリの起動ロックを作成できません。"
+            } else {
+                "Cannot create the startup lock."
+            });
+            return 1;
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
             let existing = FindWindowW(w!("MultiPointClickerRust"), null());
@@ -2271,23 +2289,19 @@ pub fn run() {
                 SetForegroundWindow(existing);
             }
             CloseHandle(mutex);
-            return;
+            return 10;
         }
         let path = model::settings_path();
         let new_settings = !path.exists();
         let (mut settings, migrated) = match Settings::load(&path) {
             Ok(s) => s,
             Err(e) => {
-                error_dialog(
-                    null_mut(),
-                    &error_text(
-                        &e,
-                        windows_sys::Win32::Globalization::GetUserDefaultUILanguage() & 0x3ff
-                            == 0x11,
-                    ),
-                );
+                startup_error(&error_text(
+                    &e,
+                    windows_sys::Win32::Globalization::GetUserDefaultUILanguage() & 0x3ff == 0x11,
+                ));
                 CloseHandle(mutex);
-                return;
+                return 1;
             }
         };
         if new_settings {
@@ -2341,16 +2355,13 @@ pub fn run() {
             null(),
         );
         if hwnd.is_null() {
-            error_dialog(
-                null_mut(),
-                if settings.lang == "ja" {
-                    "アプリのウィンドウを作成できません。"
-                } else {
-                    "Cannot create the application window."
-                },
-            );
+            startup_error(if settings.lang == "ja" {
+                "アプリのウィンドウを作成できません。"
+            } else {
+                "Cannot create the application window."
+            });
             CloseHandle(mutex);
-            return;
+            return 1;
         }
         let small_icon = LoadImageW(
             instance,
@@ -2409,16 +2420,21 @@ pub fn run() {
         SendMessageW(hwnd, APP_INIT, 0, 0);
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
-        SetTimer(hwnd, TICK, 50, None);
+        let timer_ok = SetTimer(hwnd, TICK, 50, None) != 0;
+        let posted = PostMessageW(hwnd, APP_READY, 0, 0) != 0;
+        let mut exit_code = 1;
         let mut msg: MSG = zeroed();
-        loop {
-            let result = GetMessageW(&mut msg, null_mut(), 0, 0);
-            if result <= 0 {
-                break;
-            }
-            if IsDialogMessageW(hwnd, &msg) == 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+        if timer_ok && posted {
+            loop {
+                let result = GetMessageW(&mut msg, null_mut(), 0, 0);
+                if result <= 0 {
+                    exit_code = if result == 0 { msg.wParam as i32 } else { 1 };
+                    break;
+                }
+                if IsDialogMessageW(hwnd, &msg) == 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
             }
         }
         APP.with(|cell| {
@@ -2437,7 +2453,11 @@ pub fn run() {
                 DeleteObject(app.title_font);
             }
         });
+        if IsWindow(hwnd) != 0 {
+            DestroyWindow(hwnd);
+        }
         CloseHandle(mutex);
+        exit_code
     }
 }
 

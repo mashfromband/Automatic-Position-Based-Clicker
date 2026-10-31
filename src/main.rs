@@ -36,7 +36,7 @@ fn main() {
             }
             return;
         }
-        winui::run();
+        std::process::exit(winui::run());
     }
     #[cfg(not(windows))]
     eprintln!("Multi Point Clicker requires Windows.");
