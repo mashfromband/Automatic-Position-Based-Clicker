@@ -632,6 +632,90 @@ pub(crate) fn pointer_inputs(right: bool) -> [INPUT; 2] {
         },
     })
 }
+
+pub const KEY_CLICK_TAG: usize = 0x4d50434b;
+pub(crate) fn click_once_restore(x: i32, y: i32, right: bool) -> Result<(), ClickerError> {
+    let desktop = Desktop::current()?;
+    let target = Point {
+        x,
+        y,
+        interval_ticks: None,
+    };
+    desktop.validate(&target)?;
+    let mut restore: POINT = unsafe { std::mem::zeroed() };
+    if unsafe { GetCursorPos(&mut restore) } == 0 {
+        return Err(os_error(ErrorCode::InputSend));
+    }
+    desktop.validate(&Point {
+        x: restore.x,
+        y: restore.y,
+        interval_ticks: None,
+    })?;
+    let inputs = click_restore_inputs(&desktop, &target, restore, right);
+    if Desktop::current()? != desktop {
+        return Err(ErrorCode::ScreenChanged.into());
+    }
+    if unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            size_of::<INPUT>() as i32,
+        )
+    } != inputs.len() as u32
+    {
+        let err = os_error(ErrorCode::InputSend);
+        let recover = [inputs[1], inputs[2]];
+        unsafe {
+            SendInput(
+                recover.len() as u32,
+                recover.as_ptr(),
+                size_of::<INPUT>() as i32,
+            );
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn click_restore_inputs(
+    desktop: &Desktop,
+    target: &Point,
+    restore: POINT,
+    right: bool,
+) -> [INPUT; 3] {
+    let make = |x, y, flags| INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: normalize(x, desktop.left, desktop.width),
+                dy: normalize(y, desktop.top, desktop.height),
+                mouseData: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: KEY_CLICK_TAG,
+            },
+        },
+    };
+    let absolute = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    let down = if right {
+        MOUSEEVENTF_RIGHTDOWN
+    } else {
+        MOUSEEVENTF_LEFTDOWN
+    };
+    [
+        make(target.x, target.y, absolute | down),
+        make(
+            target.x,
+            target.y,
+            if right {
+                MOUSEEVENTF_RIGHTUP
+            } else {
+                MOUSEEVENTF_LEFTUP
+            },
+        ),
+        make(restore.x, restore.y, absolute),
+    ]
+}
 fn normalize(value: i32, origin: i32, size: i32) -> i32 {
     (((value as i64 - origin as i64) * 2 + 1) * 65536 / (size as i64 * 2)).clamp(0, 65535) as i32
 }
@@ -683,6 +767,57 @@ pub fn benchmark(interval_ticks: u64, count: usize) -> Result<BenchmarkReport, C
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn one_shot_is_exactly_one_click_then_cursor_restore_in_one_batch() {
+        let desktop = Desktop {
+            left: -1920,
+            top: 0,
+            width: 3840,
+            height: 1080,
+        };
+        for right in [false, true] {
+            let inputs = click_restore_inputs(
+                &desktop,
+                &Point {
+                    x: -900,
+                    y: 700,
+                    interval_ticks: None,
+                },
+                POINT { x: 900, y: 300 },
+                right,
+            );
+            let events: Vec<_> = inputs.iter().map(|i| unsafe { i.Anonymous.mi }).collect();
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.dwExtraInfo == KEY_CLICK_TAG)
+            );
+            let down = if right {
+                MOUSEEVENTF_RIGHTDOWN
+            } else {
+                MOUSEEVENTF_LEFTDOWN
+            };
+            let up = if right {
+                MOUSEEVENTF_RIGHTUP
+            } else {
+                MOUSEEVENTF_LEFTUP
+            };
+            assert_eq!(events.iter().filter(|e| e.dwFlags & down != 0).count(), 1);
+            assert_eq!(events.iter().filter(|e| e.dwFlags & up != 0).count(), 1);
+            assert_eq!(
+                (events[0].dx, events[0].dy),
+                (normalize(-900, -1920, 3840), normalize(700, 0, 1080))
+            );
+            assert_eq!(
+                (events[2].dx, events[2].dy),
+                (normalize(900, -1920, 3840), normalize(300, 0, 1080))
+            );
+            assert_eq!(
+                events[2].dwFlags,
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+            );
+        }
+    }
     #[test]
     fn area_visits_every_grid_location_without_a_large_point_buffer() {
         let area = crate::model::ClickArea::from_corners((-4, -3), (4, 3));
