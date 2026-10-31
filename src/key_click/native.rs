@@ -3,6 +3,7 @@ use std::{
     cell::RefCell,
     mem::{size_of, zeroed},
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    panic::{AssertUnwindSafe, catch_unwind},
     ptr::{null, null_mut},
     sync::{
         Arc, Mutex, RwLock,
@@ -272,6 +273,24 @@ fn dispatch(
     resolve: impl FnOnce() -> Result<Option<(i32, i32, bool)>, ClickerError>,
     emit: impl FnOnce(i32, i32, bool) -> Result<bool, ClickerError>,
 ) -> Result<bool, ClickerError> {
+    match catch_unwind(AssertUnwindSafe(|| {
+        dispatch_inner(shared, request, resolve, emit)
+    })) {
+        Ok(result) => result,
+        Err(_) => {
+            shared.active.store(false, Ordering::Release);
+            shared.desired.store(false, Ordering::Release);
+            shared.generation.fetch_add(1, Ordering::AcqRel);
+            Err(ErrorCode::WorkerPanic.into())
+        }
+    }
+}
+fn dispatch_inner(
+    shared: &Shared,
+    request: &Request,
+    resolve: impl FnOnce() -> Result<Option<(i32, i32, bool)>, ClickerError>,
+    emit: impl FnOnce(i32, i32, bool) -> Result<bool, ClickerError>,
+) -> Result<bool, ClickerError> {
     if !shared.current(request) {
         return Ok(false);
     }
@@ -293,6 +312,13 @@ fn dispatch(
         shared.clicks.fetch_add(1, Ordering::Relaxed);
     }
     Ok(clicked)
+}
+fn allowed_during_pulse(
+    shared: &Shared,
+    request: &Request,
+    foreground: impl FnOnce() -> bool,
+) -> bool {
+    shared.valid(request) && foreground()
 }
 thread_local! {static CONTEXT:RefCell<Option<Context>>=const {RefCell::new(None)};}
 unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -406,12 +432,13 @@ impl Controller {
                                 return Ok(false);
                             }
                             crate::engine::click_once_restore(x, y, right, || {
-                                worker_shared.valid(&request)
-                                    && request
+                                allowed_during_pulse(&worker_shared, &request, || {
+                                    request
                                         .snapshot
                                         .target
                                         .as_ref()
                                         .is_some_and(|target| target.foreground())
+                                })
                             })
                         },
                     );
@@ -684,12 +711,31 @@ mod tests {
             .unwrap()
         );
         // Once a pulse starts, aging alone must not cut its 50ms hold short.
-        assert!(shared.valid(&expired));
+        assert!(allowed_during_pulse(&shared, &expired, || true));
+        assert!(!allowed_during_pulse(&shared, &expired, || false));
         assert!(dispatch(&shared, &current, || Ok(Some((340, 450, true))), send).unwrap());
+        let panic = dispatch(
+            &shared,
+            &current,
+            || panic!("resolver failure fixture"),
+            send,
+        )
+        .unwrap_err();
+        assert_eq!(panic.code, ErrorCode::WorkerPanic);
+        assert!(!shared.active.load(Ordering::Acquire));
+        shared.active.store(true, Ordering::Release);
+        shared.desired.store(true, Ordering::Release);
+        let resumed = Request {
+            snapshot: current.snapshot.clone(),
+            generation: shared.generation.load(Ordering::Acquire),
+            index: 0,
+            created: Instant::now(),
+        };
+        assert!(dispatch(&shared, &resumed, || Ok(Some((560, 670, false))), send).unwrap());
         assert_eq!(
             *emitted.lock().unwrap(),
-            [(120, 230, false), (340, 450, true)]
+            [(120, 230, false), (340, 450, true), (560, 670, false)]
         );
-        assert_eq!(shared.clicks.load(Ordering::Relaxed), 2);
+        assert_eq!(shared.clicks.load(Ordering::Relaxed), 3);
     }
 }

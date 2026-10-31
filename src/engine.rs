@@ -696,9 +696,9 @@ fn game_click(io: &mut impl GameClickIo) -> Result<bool, ClickerError> {
         }
         cleanup.io.send(ClickPhase::Release)?;
         cleanup.released = true;
-        if !cleanup.io.wait(GAME_RELEASE_TIME)? {
-            return Ok(false);
-        }
+        // A successfully sent DOWN/UP pair is a completed click, even when Stop
+        // interrupts only the post-release dwell before pointer restoration.
+        let _ = cleanup.io.wait(GAME_RELEASE_TIME)?;
         Ok(true)
     })();
     let finished = cleanup.finish();
@@ -712,22 +712,30 @@ struct NativeGameClick<F> {
     events: [INPUT; 3],
     allowed: F,
 }
+fn phase_input(events: &[INPUT; 3], phase: ClickPhase, allowed: bool) -> INPUT {
+    let mut event = match phase {
+        ClickPhase::Press => events[0],
+        ClickPhase::Release => events[1],
+        ClickPhase::Restore => events[2],
+    };
+    if phase == ClickPhase::Release && !allowed {
+        unsafe {
+            event.Anonymous.mi.dwFlags &=
+                !(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK);
+        }
+    }
+    event
+}
 impl<F: Fn() -> bool> GameClickIo for NativeGameClick<F> {
     fn allowed(&mut self) -> bool {
         (self.allowed)()
     }
     fn send(&mut self, phase: ClickPhase) -> Result<(), ClickerError> {
-        let mut event = match phase {
-            ClickPhase::Press => self.events[0],
-            ClickPhase::Release => self.events[1],
-            ClickPhase::Restore => self.events[2],
-        };
-        if phase == ClickPhase::Release && !(self.allowed)() {
-            unsafe {
-                event.Anonymous.mi.dwFlags &=
-                    !(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK);
-            }
-        }
+        let event = phase_input(
+            &self.events,
+            phase,
+            phase != ClickPhase::Release || (self.allowed)(),
+        );
         if unsafe { SendInput(1, &event, size_of::<INPUT>() as i32) } != 1 {
             return Err(os_error(ErrorCode::InputSend));
         }
@@ -1040,7 +1048,7 @@ mod tests {
         for cancel in [Some(1), Some(2)] {
             let mut io = sampled_click(16_666_666, 1, false);
             io.cancel_wait = cancel;
-            assert!(!game_click(&mut io).unwrap());
+            assert_eq!(game_click(&mut io).unwrap(), cancel == Some(2));
             assert!(!io.game.down);
             assert_eq!(
                 io.phases
@@ -1091,6 +1099,38 @@ mod tests {
         assert_eq!(
             io.0.phases,
             [ClickPhase::Press, ClickPhase::Release, ClickPhase::Restore]
+        );
+    }
+    #[test]
+    fn cancelled_native_release_keeps_up_and_tag_without_repositioning() {
+        let io = sampled_click(16_666_666, 1, false);
+        for right in [false, true] {
+            let events = sampled_click(16_666_666, 1, right).events;
+            let release = unsafe {
+                phase_input(&events, ClickPhase::Release, false)
+                    .Anonymous
+                    .mi
+            };
+            assert_eq!(
+                release.dwFlags,
+                if right {
+                    MOUSEEVENTF_RIGHTUP
+                } else {
+                    MOUSEEVENTF_LEFTUP
+                }
+            );
+            assert_eq!(release.dwExtraInfo, KEY_CLICK_TAG);
+            let normal = unsafe { phase_input(&events, ClickPhase::Release, true).Anonymous.mi };
+            assert_ne!(normal.dwFlags & MOUSEEVENTF_MOVE, 0);
+        }
+        let restore = unsafe {
+            phase_input(&io.events, ClickPhase::Restore, false)
+                .Anonymous
+                .mi
+        };
+        assert_eq!(
+            restore.dwFlags,
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
         );
     }
     #[test]
