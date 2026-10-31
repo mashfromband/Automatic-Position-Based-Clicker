@@ -159,9 +159,19 @@ impl Default for KeyState {
 }
 impl KeyState {
     pub fn seed_down(&mut self, keys: impl IntoIterator<Item = u32>) {
+        let mut observed = [false; 256];
         for key in keys {
-            if let Some(value) = self.down.get_mut(key as usize) {
+            if let Some(value) = observed.get_mut(key as usize) {
                 *value = true;
+            }
+        }
+        for (index, down) in observed.into_iter().enumerate() {
+            // Suppressed downs may be logically up in Windows. Preserve them until
+            // their physical UP; clearing them could turn a repeat into a new click.
+            if !self.consumed[index] {
+                self.down[index] = down;
+            } else if down {
+                self.down[index] = true;
             }
         }
     }
@@ -207,6 +217,26 @@ impl KeyState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reseeding_releases_unconsumed_keys_but_keeps_a_suppressed_hold() {
+        let mut state = KeyState::default();
+        state.event(b'W' as u32, true, false, Some(0), false);
+        state.event(b'A' as u32, true, false, None, false);
+        state.seed_down([]);
+        assert_eq!(
+            state.event(b'W' as u32, true, false, Some(0), false).click,
+            None
+        );
+        assert_eq!(
+            state.event(b'A' as u32, true, false, Some(1), false).click,
+            Some(1)
+        );
+        state.event(b'W' as u32, false, false, Some(0), false);
+        assert_eq!(
+            state.event(b'W' as u32, true, false, Some(0), false).click,
+            Some(0)
+        );
+    }
     #[test]
     fn key_capture_finishes_on_release_and_keeps_the_original_modifiers() {
         let mut capture = KeyCapture::default();

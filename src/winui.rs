@@ -774,7 +774,10 @@ impl App {
             !self.busy() && self.settings.key_clicks.bindings.len() < key_click::MAX_BINDINGS,
         );
         self.enable(KEY_WASD, !self.busy());
-        self.enable(KEY_ENABLE, !self.busy());
+        self.enable(
+            KEY_ENABLE,
+            !self.busy() && (self.hotkeys_ready || self.settings.key_clicks.enabled),
+        );
         self.enable(KEY_TARGET, !self.busy());
         y += 59;
         let restore = self
@@ -792,6 +795,8 @@ impl App {
     }
     fn sync_key_runtime(&mut self, allow_start: bool) {
         let active = self.settings.key_clicks.enabled
+            && self.hotkeys_ready
+            && !self.key_bindings_conflict()
             && !self.busy()
             && self.capturing.is_none()
             && self.key_pick.is_none()
@@ -816,6 +821,21 @@ impl App {
             controller.configure(self.key_target.clone(), &self.settings.key_clicks);
             controller.set_active(active);
         }
+    }
+    fn key_conflict(&self, key: u32) -> bool {
+        self.settings
+            .hotkeys
+            .values()
+            .filter_map(|value| parse_hotkey(value))
+            .any(|(mods, registered)| mods == 0 && registered == key)
+    }
+    fn key_bindings_conflict(&self) -> bool {
+        self.settings
+            .key_clicks
+            .bindings
+            .iter()
+            .filter_map(|b| b.key)
+            .any(|key| self.key_conflict(key))
     }
     fn begin_key_pick(&mut self, mode: KeyPick) {
         if matches!(mode, KeyPick::Position(_)) && self.key_target.is_none() {
@@ -1509,7 +1529,17 @@ impl App {
             }
         }
         if self.tab == 2 {
-            let status = if !self.settings.key_clicks.enabled {
+            let status = if !self.hotkeys_ready {
+                self.t(
+                    "停止キーを含むショートカットを設定し直してください。",
+                    "Configure working operation hotkeys, including Stop.",
+                )
+            } else if self.key_bindings_conflict() {
+                self.t(
+                    "操作用ショートカットと同じキーが登録されています。",
+                    "A key conflicts with an operation hotkey.",
+                )
+            } else if !self.settings.key_clicks.enabled {
                 self.t("停止中", "Disabled")
             } else if self.busy() {
                 self.t(
@@ -1563,7 +1593,20 @@ impl App {
                 .map_or(0, KeyController::clicks);
             set_text(
                 self.control(KEY_STATUS),
-                &format!("{}\n{}: {}", status, self.t("クリック数", "Clicks"), count),
+                &format!(
+                    "{}\n{}: {}   {}: {}",
+                    status,
+                    self.t("クリック数", "Clicks"),
+                    count,
+                    self.t("停止", "Stop"),
+                    format_hotkey(
+                        self.settings
+                            .hotkeys
+                            .get("click_stop")
+                            .map(String::as_str)
+                            .unwrap_or("")
+                    )
+                ),
             );
             set_text(self.control(MESSAGE), &self.message);
         }
@@ -1836,6 +1879,19 @@ impl App {
             if !self.commit() {
                 return;
             }
+            if id == KEY_ENABLE
+                && !self.settings.key_clicks.enabled
+                && (!self.hotkeys_ready || self.key_bindings_conflict())
+            {
+                self.message = self
+                    .t(
+                        "停止キーを含むショートカットと、キーの重複を確認してください。",
+                        "Check the Stop hotkey and resolve conflicting keys first.",
+                    )
+                    .into();
+                self.rebuild();
+                return;
+            }
             match id {
                 KEY_ENABLE => self.settings.key_clicks.enabled = !self.settings.key_clicks.enabled,
                 KEY_ADD => {
@@ -1847,13 +1903,28 @@ impl App {
                     }
                 }
                 KEY_WASD => {
-                    if !self.settings.key_clicks.add_wasd() {
+                    let mut candidate = self.settings.key_clicks.clone();
+                    if !candidate.add_wasd() {
                         self.message = self
                             .t(
                                 "キーの登録は16個までです。",
                                 "You can assign up to 16 keys.",
                             )
                             .into();
+                    } else if candidate
+                        .bindings
+                        .iter()
+                        .filter_map(|b| b.key)
+                        .any(|key| self.key_conflict(key))
+                    {
+                        self.message = self
+                            .t(
+                                "WASDのキーが操作用ショートカットで使用中です。",
+                                "A WASD key is already used by an operation hotkey.",
+                            )
+                            .into();
+                    } else {
+                        self.settings.key_clicks = candidate;
                     }
                 }
                 _ if id >= KEY_DELETE => {
@@ -2135,7 +2206,7 @@ impl App {
         }
         if i >= ACTIONS.len() {
             let index = i - ACTIONS.len();
-            if !key_click::supported_key(key) || mods & (MOD_CONTROL | MOD_ALT | MOD_WIN) != 0 {
+            if !key_click::supported_key(key) || mods != 0 {
                 self.message = self
                     .t(
                         "Wなど単独のキーを選んでください。",
@@ -2149,12 +2220,7 @@ impl App {
                 .iter()
                 .enumerate()
                 .any(|(other, b)| other != index && b.key == Some(key))
-                || self
-                    .settings
-                    .hotkeys
-                    .values()
-                    .filter_map(|value| parse_hotkey(value))
-                    .any(|(m, k)| k == key && m & (MOD_CONTROL | MOD_ALT | MOD_WIN) == 0)
+                || self.key_conflict(key)
             {
                 self.message = self
                     .t(
@@ -2170,7 +2236,7 @@ impl App {
             self.rebuild();
             return;
         }
-        if mods & (MOD_CONTROL | MOD_ALT | MOD_WIN) == 0
+        if mods == 0
             && self
                 .settings
                 .key_clicks
@@ -3369,6 +3435,47 @@ pub fn input_probe(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn key_clicks_refuse_enable_without_a_registered_stop_and_show_custom_stop() {
+        let mut fixture = TestApp::new();
+        let app = &mut fixture.app;
+        app.action(NAV_KEYS);
+        app.action(KEY_WASD);
+        assert!(app.register_hotkeys_using(|_, _, _| false).is_err());
+        app.rebuild();
+        app.action(KEY_ENABLE);
+        assert!(!app.settings.key_clicks.enabled);
+        assert!(app.key_controller.is_none());
+        assert_eq!(unsafe { IsWindowEnabled(app.control(KEY_ENABLE)) }, 0);
+        app.hotkeys_ready = true;
+        app.settings
+            .hotkeys
+            .insert("click_stop".into(), "f8".into());
+        app.rebuild();
+        assert!(text(app.control(KEY_STATUS)).contains("F8"));
+        app.action(KEY_ENABLE);
+        assert!(app.settings.key_clicks.enabled);
+    }
+    #[test]
+    fn wasd_preset_keeps_the_existing_map_when_an_operation_key_conflicts() {
+        let mut fixture = TestApp::new();
+        let app = &mut fixture.app;
+        app.settings
+            .hotkeys
+            .insert("click_start".into(), "w".into());
+        app.action(NAV_KEYS);
+        app.action(KEY_WASD);
+        assert!(app.settings.key_clicks.bindings.is_empty());
+        assert_eq!(app.settings.hotkeys["click_start"], "w");
+        app.action(KEY_ADD);
+        app.capturing = Some(ACTIONS.len());
+        app.captured(0, b'W' as u32);
+        assert_eq!(app.settings.key_clicks.bindings[0].key, None);
+        app.settings.key_clicks.bindings[0].key = Some(b'W' as u32);
+        app.action(KEY_ENABLE);
+        assert!(!app.settings.key_clicks.enabled);
+        assert!(app.key_bindings_conflict());
+    }
     #[test]
     fn key_click_controls_save_independent_wasd_and_preserve_other_settings() {
         let mut fixture = TestApp::new();

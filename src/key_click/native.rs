@@ -169,7 +169,7 @@ impl Target {
         Ok((rect.right, rect.bottom))
     }
     pub fn record_point(&self, point: POINT) -> Result<ClientPoint, ClickerError> {
-        if window_at(point) != Some(self.window as HWND) {
+        if !self.context_matches() || window_at(point) != Some(self.window as HWND) {
             return Err(ErrorCode::KeyTarget.into());
         }
         let (width, height) = self.client_size()?;
@@ -306,6 +306,7 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
                 return false;
             };
             let shared = &context.shared;
+            let generation = shared.generation.load(Ordering::Acquire);
             let snapshot = shared.snapshot.try_read().ok().map(|s| s.clone());
             let ready = shared.active.load(Ordering::Acquire)
                 && shared.desired.load(Ordering::Acquire)
@@ -317,7 +318,7 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
                         .position(|b| b.key == Some(event.vkCode) && b.position.is_some())
                 })
             });
-            let modifiers = [VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
+            let modifiers = [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
                 .into_iter()
                 .any(|key| unsafe { GetAsyncKeyState(key as i32) } < 0);
             let decision = context.keys.event(
@@ -331,7 +332,7 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
                 if let Some(snapshot) = snapshot {
                     let request = Request {
                         snapshot,
-                        generation: shared.generation.load(Ordering::Acquire),
+                        generation,
                         index,
                     };
                     if context.sender.try_send(request).is_err() {
@@ -586,7 +587,7 @@ impl Drop for Controller {
 mod tests {
     use super::*;
     #[test]
-    fn dispatch_clicks_only_the_current_enabled_request_and_the_selected_scope() {
+    fn dispatch_clicks_only_the_current_enabled_request_and_resolved_input() {
         let snapshot = Arc::new(Snapshot::default());
         let shared = Shared {
             snapshot: RwLock::new(snapshot.clone()),
