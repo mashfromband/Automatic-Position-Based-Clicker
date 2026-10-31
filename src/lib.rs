@@ -3,6 +3,7 @@ pub mod drag;
 #[cfg(windows)]
 pub mod engine;
 pub mod error;
+pub mod key_click;
 pub mod model;
 pub mod startup;
 pub mod updater;

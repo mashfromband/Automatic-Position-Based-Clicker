@@ -1,6 +1,10 @@
 use multi_point_clicker::{
     engine::{Progress, Runner},
     error::{ClickerError, ErrorCode},
+    key_click::{
+        self, KeyBinding,
+        native::{Controller as KeyController, Target as KeyTarget},
+    },
     model::{self, ACTIONS, ClickArea, ClickMode, MAX_POINTS, Point, Settings},
 };
 use std::{
@@ -9,7 +13,10 @@ use std::{
     mem::{size_of, zeroed},
     path::PathBuf,
     ptr::{null, null_mut},
-    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 use windows_sys::{
@@ -26,12 +33,15 @@ const APP_RECORD: u32 = WM_APP + 1;
 const APP_CAPTURE: u32 = WM_APP + 2;
 const APP_INIT: u32 = WM_APP + 3;
 const APP_READY: u32 = WM_APP + 4;
+const APP_KEY_PICK: u32 = WM_APP + 5;
+const APP_KEY_CANCEL: u32 = WM_APP + 6;
 const STATIC_LEFT: u32 = 0; // SS_LEFT (the default STATIC control alignment).
 const TICK: usize = 1;
 const PREVIEW_TIMER: usize = 2;
 const NAV_MAIN: u16 = 10;
 const NAV_SETTINGS: u16 = 11;
 const LANG: u16 = 12;
+const NAV_KEYS: u16 = 13;
 const RECORD: u16 = 20;
 const RECORD_STOP: u16 = 21;
 const START: u16 = 22;
@@ -66,6 +76,18 @@ const CLICKS: u16 = 501;
 const CYCLES: u16 = 502;
 const ELAPSED: u16 = 503;
 const MESSAGE: u16 = 504;
+const KEY_ENABLE: u16 = 520;
+const KEY_TARGET: u16 = 521;
+const KEY_ADD: u16 = 522;
+const KEY_WASD: u16 = 523;
+const KEY_STATUS: u16 = 524;
+const KEY_BIND: u16 = 600;
+const KEY_POSITION: u16 = 650;
+const KEY_BUTTON: u16 = 700;
+const KEY_DELETE: u16 = 750;
+static KEY_PICKING: AtomicBool = AtomicBool::new(false);
+thread_local! {static KEY_PICK_ORIGIN:RefCell<Option<POINT>>=const{RefCell::new(None)};}
+thread_local! {static KEY_CAPTURE_STATE:RefCell<key_click::KeyCapture>=RefCell::new(key_click::KeyCapture::default());}
 static ROOT: AtomicUsize = AtomicUsize::new(0);
 static CAPTURE: AtomicU32 = AtomicU32::new(0);
 static DARK: AtomicU32 = AtomicU32::new(1);
@@ -135,6 +157,14 @@ fn error_dialog(hwnd: HWND, s: &str) {
 fn error_text(error: &ClickerError, japanese: bool) -> String {
     use ErrorCode::*;
     let pair = match error.code {
+        KeyMapping => (
+            "キーや登録位置が不正です。重複も確認してください。",
+            "Invalid or duplicate key mapping. Check the keys and positions.",
+        ),
+        KeyTarget => (
+            "対象のゲーム画面を選択し、登録位置を確認してください。",
+            "Select the target game window and check the recorded position.",
+        ),
         AreaMissing => (
             "先に範囲の2隅を指定してください。",
             "Select the two corners of a region first.",
@@ -144,8 +174,8 @@ fn error_text(error: &ClickerError, japanese: bool) -> String {
             "Invalid region coordinates or grid spacing (1–4096 px).",
         ),
         InputMonitor => (
-            "ドラッグの入力監視を開始できません。",
-            "Cannot start monitoring physical drag input.",
+            "入力の監視を開始できません。",
+            "Cannot start monitoring input.",
         ),
         IntervalRange => (
             "間隔は 0.0000001〜3600.0000000 秒で指定してください。",
@@ -281,6 +311,14 @@ struct App {
     wheel_remainder: i32,
     main_offset: i32,
     selecting_area: bool,
+    key_controller: Option<KeyController>,
+    key_target: Option<Arc<KeyTarget>>,
+    key_pick: Option<KeyPick>,
+}
+#[derive(Clone, Copy)]
+enum KeyPick {
+    Game,
+    Position(usize),
 }
 
 impl App {
@@ -381,7 +419,7 @@ impl App {
         self.create(id, w!("STATIC"), caption, STATIC_LEFT, [x, y, w, h]);
     }
     fn button(&mut self, id: u16, caption: &str, x: i32, y: i32, w: i32, h: i32) {
-        if id == INDIVIDUAL || id == TOPMOST {
+        if id == INDIVIDUAL || id == TOPMOST || id == KEY_ENABLE {
             let child = self.create(
                 id,
                 w!("BUTTON"),
@@ -391,8 +429,10 @@ impl App {
             );
             let checked = if id == INDIVIDUAL {
                 self.settings.per_point
-            } else {
+            } else if id == TOPMOST {
                 self.settings.topmost
+            } else {
+                self.settings.key_clicks.enabled
             };
             unsafe {
                 SendMessageW(child, BM_SETCHECK, usize::from(checked), 0);
@@ -434,6 +474,7 @@ impl App {
         } else {
             self.saved_error = false;
         }
+        self.sync_key_runtime(!self.saved_error);
         set_text(self.control(MESSAGE), &self.message);
     }
     fn numbers(&mut self) -> Result<(), String> {
@@ -510,7 +551,7 @@ impl App {
                 p.interval_ticks = Some(ms);
             }
             set_text(self.control(INTERVAL), &model::format_interval(interval));
-        } else {
+        } else if self.tab == 1 {
             let seconds = text(self.control(DELAY))
                 .trim()
                 .parse::<u64>()
@@ -593,15 +634,358 @@ impl App {
         self.button(LANG, &lang, 440, 17, 185, 32);
         let main = self.t("メイン", "Main").to_string();
         let settings = self.t("設定", "Settings").to_string();
+        let keys = self.t("キーでクリック", "Key clicks").to_string();
         self.button(NAV_MAIN, &main, 22, 63, 120, 34);
-        self.button(NAV_SETTINGS, &settings, 148, 63, 120, 34);
+        self.button(NAV_KEYS, &keys, 148, 63, 190, 34);
+        self.button(NAV_SETTINGS, &settings, 344, 63, 120, 34);
         if self.tab == 0 {
             self.build_main();
-        } else {
+        } else if self.tab == 1 {
             self.build_settings();
+        } else {
+            self.build_key_clicks();
         }
         self.position_controls();
         self.update_stats();
+    }
+    fn build_key_clicks(&mut self) {
+        self.main_offset = 0;
+        let title = self.t("キーでクリック", "Key clicks").to_string();
+        self.label(&title, 30, 118, 585, 32);
+        let helper = self
+            .t(
+                "キー1回で、登録した位置を1回クリックします。",
+                "Each physical key press clicks its recorded position once.",
+            )
+            .to_string();
+        self.label(&helper, 30, 159, 585, 28);
+        let name = self
+            .key_target
+            .as_ref()
+            .map(|t| t.identity.title.as_str())
+            .or_else(|| {
+                self.settings
+                    .key_clicks
+                    .last_target
+                    .as_ref()
+                    .map(|t| t.title.as_str())
+            })
+            .unwrap_or(self.t("未選択", "Not selected"));
+        let short: String = name.chars().take(27).collect();
+        let target = format!("{}: {}", self.t("対象ゲーム", "Target game"), short);
+        self.label(&target, 30, 198, 340, 45);
+        let choose = self.t("ゲーム画面を選ぶ", "Choose game window").to_string();
+        self.button(KEY_TARGET, &choose, 385, 197, 230, 36);
+        let enable = self
+            .t("キー操作を有効にする", "Enable key clicks")
+            .to_string();
+        self.button(KEY_ENABLE, &enable, 30, 254, 585, 30);
+        let hint = self
+            .t(
+                "選んだ画面が前面のときだけ有効です。",
+                "Active only while the selected game window is in front.",
+            )
+            .to_string();
+        self.label(&hint, 30, 289, 585, 28);
+        let headers = [
+            self.t("キー", "Key"),
+            self.t("ゲーム内の位置", "Game position"),
+            self.t("クリック", "Click"),
+        ]
+        .map(str::to_string);
+        self.label(&headers[0], 32, 334, 80, 25);
+        self.label(&headers[1], 125, 334, 180, 25);
+        self.label(&headers[2], 315, 334, 75, 25);
+        let mut y = 371;
+        for (i, binding) in self.settings.key_clicks.bindings.clone().iter().enumerate() {
+            let key = if self.capturing == Some(ACTIONS.len() + i) {
+                self.t("入力待ち", "Press key").to_string()
+            } else {
+                binding
+                    .key
+                    .map(key_name)
+                    .unwrap_or_else(|| self.t("キー選択", "Set key").into())
+            };
+            self.button(KEY_BIND + i as u16, &key, 30, y, 82, 33);
+            let location = binding
+                .position
+                .as_ref()
+                .map(|p| {
+                    if self
+                        .key_target
+                        .as_ref()
+                        .and_then(|target| target.client_size().ok().map(|size| (target, size)))
+                        .is_some_and(|(target, (w, h))| !p.fits(&target.identity, w, h))
+                    {
+                        self.t("位置を取り直してください", "Record again").into()
+                    } else {
+                        format!("X {}   Y {}", p.x, p.y)
+                    }
+                })
+                .unwrap_or_else(|| self.t("位置を選んでください", "Record a position").into());
+            self.label(&location, 125, y + 5, 183, 28);
+            let combo = self.create(
+                KEY_BUTTON + i as u16,
+                w!("COMBOBOX"),
+                "",
+                WS_TABSTOP | CBS_DROPDOWNLIST as u32,
+                [315, y, 70, 100],
+            );
+            for label in [self.t("左", "Left"), self.t("右", "Right")] {
+                unsafe {
+                    SendMessageW(combo, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
+                }
+            }
+            unsafe {
+                SendMessageW(combo, CB_SETCURSEL, usize::from(binding.right), 0);
+            }
+            let pick = self.t("位置を記憶", "Record position").to_string();
+            self.button(KEY_POSITION + i as u16, &pick, 397, y, 133, 33);
+            let delete = self.t("削除", "Delete").to_string();
+            self.button(KEY_DELETE + i as u16, &delete, 540, y, 75, 33);
+            for base in [KEY_BIND, KEY_POSITION, KEY_BUTTON, KEY_DELETE] {
+                self.enable(base + i as u16, !self.busy());
+            }
+            y += 44;
+        }
+        if self.settings.key_clicks.bindings.is_empty() {
+            let empty = self
+                .t(
+                    "WASDを追加して、それぞれの位置を記憶してください。",
+                    "Add WASD, then record each virtual controller position.",
+                )
+                .to_string();
+            self.label(&empty, 30, y, 585, 48);
+            y += 58;
+        }
+        y += 10;
+        let add = self.t("＋ 追加", "+ Add").to_string();
+        self.button(KEY_ADD, &add, 30, y, 125, 34);
+        let wasd = self.t("WASDを追加", "Add WASD").to_string();
+        self.button(KEY_WASD, &wasd, 165, y, 190, 34);
+        let count = format!(
+            "{} / {}",
+            self.settings.key_clicks.bindings.len(),
+            key_click::MAX_BINDINGS
+        );
+        self.label(&count, 475, y + 6, 140, 25);
+        self.enable(
+            KEY_ADD,
+            !self.busy() && self.settings.key_clicks.bindings.len() < key_click::MAX_BINDINGS,
+        );
+        self.enable(KEY_WASD, !self.busy());
+        self.enable(
+            KEY_ENABLE,
+            !self.busy() && (self.hotkeys_ready || self.settings.key_clicks.enabled),
+        );
+        self.enable(KEY_TARGET, !self.busy());
+        y += 59;
+        let restore = self
+            .t(
+                "クリック後、マウス位置を元に戻します。",
+                "The pointer returns to its original position after each click.",
+            )
+            .to_string();
+        self.label(&restore, 30, y, 585, 28);
+        y += 39;
+        self.label_id(KEY_STATUS, "", 30, y, 585, 53);
+        y += 66;
+        self.label_id(MESSAGE, &self.message.clone(), 30, y, 585, 60);
+        self.content_height = y + 85;
+    }
+    fn sync_key_runtime(&mut self, allow_start: bool) {
+        let active = self.settings.key_clicks.enabled
+            && self.hotkeys_ready
+            && !self.key_bindings_conflict()
+            && !self.busy()
+            && self.capturing.is_none()
+            && self.key_pick.is_none()
+            && !self.saved_error
+            && self.key_target.is_some();
+        if self.key_controller.is_none()
+            && active
+            && allow_start
+            && self
+                .settings
+                .key_clicks
+                .bindings
+                .iter()
+                .any(|b| b.key.is_some() && b.position.is_some())
+        {
+            match KeyController::start() {
+                Ok(controller) => self.key_controller = Some(controller),
+                Err(error) => self.message = error_text(&error, self.settings.lang == "ja"),
+            }
+        }
+        if let Some(controller) = self.key_controller.as_mut() {
+            controller.configure(self.key_target.clone(), &self.settings.key_clicks);
+            controller.set_active(active);
+        }
+    }
+    fn key_conflict(&self, key: u32) -> bool {
+        self.settings
+            .hotkeys
+            .values()
+            .filter_map(|value| parse_hotkey(value))
+            .any(|(mods, registered)| mods == 0 && registered == key)
+    }
+    fn key_bindings_conflict(&self) -> bool {
+        self.settings
+            .key_clicks
+            .bindings
+            .iter()
+            .filter_map(|b| b.key)
+            .any(|key| self.key_conflict(key))
+    }
+    fn begin_key_pick(&mut self, mode: KeyPick) {
+        if matches!(mode, KeyPick::Position(_)) && self.key_target.is_none() {
+            self.message = self
+                .t(
+                    "先にゲーム画面を選んでください。",
+                    "Choose the game window first.",
+                )
+                .into();
+            self.rebuild();
+            return;
+        }
+        self.cancel_capture();
+        if let Some(controller) = &self.key_controller {
+            controller.set_active(false);
+        }
+        self.key_pick = Some(mode);
+        KEY_PICKING.store(true, Ordering::Release);
+        KEY_PICK_ORIGIN.with(|point| *point.borrow_mut() = None);
+        self.mouse_hook = unsafe {
+            SetWindowsHookExW(
+                WH_MOUSE_LL,
+                Some(key_pick_mouse_hook),
+                GetModuleHandleW(null()),
+                0,
+            )
+        };
+        self.keyboard_hook = unsafe {
+            SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(keyboard_hook),
+                GetModuleHandleW(null()),
+                0,
+            )
+        };
+        if self.mouse_hook.is_null() || self.keyboard_hook.is_null() {
+            self.cancel_key_pick();
+            self.message = self
+                .t(
+                    "位置を記憶するための入力監視を開始できません。",
+                    "Cannot start input monitoring for position capture.",
+                )
+                .into();
+            self.rebuild();
+            return;
+        }
+        self.message = self
+            .t(
+                "ゲーム画面の位置をクリックしてください。Escで取消。",
+                "Click the position in the game. Esc cancels.",
+            )
+            .into();
+        unsafe {
+            ShowWindow(self.hwnd, SW_HIDE);
+        }
+    }
+    fn cancel_key_pick(&mut self) {
+        if self.key_pick.take().is_none() {
+            return;
+        }
+        KEY_PICKING.store(false, Ordering::Release);
+        KEY_PICK_ORIGIN.with(|point| *point.borrow_mut() = None);
+        unsafe {
+            if !self.mouse_hook.is_null() {
+                UnhookWindowsHookEx(self.mouse_hook);
+                self.mouse_hook = null_mut();
+            }
+            if !self.keyboard_hook.is_null() {
+                UnhookWindowsHookEx(self.keyboard_hook);
+                self.keyboard_hook = null_mut();
+            }
+            ShowWindow(self.hwnd, SW_SHOW);
+            SetForegroundWindow(self.hwnd);
+        }
+    }
+    fn key_pick_finished(&mut self, x: i32, y: i32) {
+        let Some(mode) = self.key_pick else {
+            return;
+        };
+        let screen = POINT { x, y };
+        let result = match mode {
+            KeyPick::Game => KeyTarget::capture_at(screen).map(|target| {
+                self.settings.key_clicks.last_target = Some(target.identity.clone());
+                self.key_target = Some(target);
+            }),
+            KeyPick::Position(index) => self
+                .key_target
+                .as_ref()
+                .ok_or_else(|| ErrorCode::KeyTarget.into())
+                .and_then(|target| target.record_point(screen))
+                .and_then(|point| {
+                    let row = self
+                        .settings
+                        .key_clicks
+                        .bindings
+                        .get_mut(index)
+                        .ok_or(ErrorCode::KeyMapping)?;
+                    row.position = Some(point);
+                    Ok(())
+                }),
+        };
+        self.cancel_key_pick();
+        match result {
+            Ok(()) => {
+                self.message = self
+                    .t(
+                        "ゲーム画面と登録位置を保存しました。",
+                        "Game window and position saved.",
+                    )
+                    .into();
+                self.save();
+            }
+            Err(error) => self.message = error_text(&error, self.settings.lang == "ja"),
+        }
+        self.rebuild();
+    }
+    fn start_key_capture(&mut self, index: usize) {
+        self.cancel_capture();
+        if let Some(controller) = &self.key_controller {
+            controller.set_active(false);
+        }
+        KEY_CAPTURE_STATE.with(|state| *state.borrow_mut() = key_click::KeyCapture::default());
+        self.capturing = Some(index);
+        CAPTURE.store((index + 1) as u32, Ordering::Release);
+        self.keyboard_hook = unsafe {
+            SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(keyboard_hook),
+                GetModuleHandleW(null()),
+                0,
+            )
+        };
+        if self.keyboard_hook.is_null() {
+            self.capturing = None;
+            CAPTURE.store(0, Ordering::Release);
+            self.message = self
+                .t(
+                    "キーの入力を監視できません。",
+                    "Cannot capture keyboard input.",
+                )
+                .into();
+        } else {
+            self.message = self
+                .t(
+                    "割り当てるキーを押して離してください（Escで取消）。",
+                    "Press and release the key to assign (Esc cancels).",
+                )
+                .into();
+        }
+        self.rebuild();
     }
     fn build_main(&mut self) {
         self.main_offset = 0;
@@ -1136,6 +1520,96 @@ impl App {
             let label = self.lock_caption(self.last.locked);
             set_text(self.control(LOCK), label);
         }
+        self.sync_key_runtime(false);
+        if let Some(controller) = &self.key_controller {
+            if let Some(error) = controller.take_error() {
+                if self.settings.key_clicks.enabled {
+                    self.message = error_text(&error, self.settings.lang == "ja");
+                }
+            }
+        }
+        if self.tab == 2 {
+            let status = if !self.hotkeys_ready {
+                self.t(
+                    "停止キーを含むショートカットを設定し直してください。",
+                    "Configure working operation hotkeys, including Stop.",
+                )
+            } else if self.key_bindings_conflict() {
+                self.t(
+                    "操作用ショートカットと同じキーが登録されています。",
+                    "A key conflicts with an operation hotkey.",
+                )
+            } else if !self.settings.key_clicks.enabled {
+                self.t("停止中", "Disabled")
+            } else if self.busy() {
+                self.t(
+                    "連打・位置の記録中は一時停止します。",
+                    "Paused during auto-clicking or position recording.",
+                )
+            } else if self
+                .key_target
+                .as_ref()
+                .is_none_or(|target| !target.alive())
+            {
+                self.t("ゲーム画面を選択してください。", "Choose the game window.")
+            } else if self
+                .key_target
+                .as_ref()
+                .is_some_and(|target| !target.context_matches())
+            {
+                self.t(
+                    "ゲーム画面が切り替わりました。選び直してください。",
+                    "The game window changed. Select it again.",
+                )
+            } else if self.key_target.as_ref().is_some_and(|target| {
+                !target.client_size().is_ok_and(|(w, h)| {
+                    self.settings.key_clicks.bindings.iter().any(|binding| {
+                        binding.key.is_some()
+                            && binding
+                                .position
+                                .as_ref()
+                                .is_some_and(|p| p.fits(&target.identity, w, h))
+                    })
+                })
+            }) {
+                self.t(
+                    "キーと位置を記憶してください。画面サイズが変わった場合も取り直してください。",
+                    "Assign keys and positions. Record again after resizing the game.",
+                )
+            } else if self.key_controller.is_none() {
+                self.t(
+                    "キー操作を開始できません。設定を確認してください。",
+                    "Key clicks could not start. Check the settings.",
+                )
+            } else {
+                self.t(
+                    "選択したゲーム画面が前面のとき操作できます。",
+                    "Ready while the selected game window is in front.",
+                )
+            };
+            let count = self
+                .key_controller
+                .as_ref()
+                .map_or(0, KeyController::clicks);
+            set_text(
+                self.control(KEY_STATUS),
+                &format!(
+                    "{}\n{}: {}   {}: {}",
+                    status,
+                    self.t("クリック数", "Clicks"),
+                    count,
+                    self.t("停止", "Stop"),
+                    format_hotkey(
+                        self.settings
+                            .hotkeys
+                            .get("click_stop")
+                            .map(String::as_str)
+                            .unwrap_or("")
+                    )
+                ),
+            );
+            set_text(self.control(MESSAGE), &self.message);
+        }
     }
     fn clear_markers(&mut self) {
         for hwnd in self.markers.drain(..) {
@@ -1245,6 +1719,15 @@ impl App {
             return;
         }
         if id == STOP {
+            self.cancel_capture();
+            if let Some(controller) = &self.key_controller {
+                controller.set_active(false);
+            }
+            if self.settings.key_clicks.enabled {
+                self.settings.key_clicks.enabled = false;
+                self.save();
+                self.rebuild();
+            }
             if let Some(mut r) = self.runner.take() {
                 r.stop();
                 self.last = r.snapshot();
@@ -1306,12 +1789,18 @@ impl App {
             self.rebuild();
             return;
         }
-        if id == NAV_MAIN || id == NAV_SETTINGS {
+        if id == NAV_MAIN || id == NAV_SETTINGS || id == NAV_KEYS {
             if !self.busy() && !self.commit() {
                 return;
             }
             self.cancel_capture();
-            self.tab = if id == NAV_MAIN { 0 } else { 1 };
+            self.tab = if id == NAV_MAIN {
+                0
+            } else if id == NAV_SETTINGS {
+                1
+            } else {
+                2
+            };
             self.scroll = 0;
             self.wheel_remainder = 0;
             self.rebuild();
@@ -1360,6 +1849,106 @@ impl App {
         if self.busy() {
             return;
         }
+        if id == KEY_TARGET {
+            if self.commit() {
+                self.begin_key_pick(KeyPick::Game);
+            }
+            return;
+        }
+        if (KEY_POSITION..KEY_POSITION + key_click::MAX_BINDINGS as u16).contains(&id) {
+            let index = (id - KEY_POSITION) as usize;
+            if index < self.settings.key_clicks.bindings.len() && self.commit() {
+                self.begin_key_pick(KeyPick::Position(index));
+            }
+            return;
+        }
+        if (KEY_BIND..KEY_BIND + key_click::MAX_BINDINGS as u16).contains(&id) {
+            let index = (id - KEY_BIND) as usize;
+            if index < self.settings.key_clicks.bindings.len() && self.commit() {
+                self.start_key_capture(ACTIONS.len() + index);
+            }
+            return;
+        }
+        if id == KEY_ENABLE
+            || id == KEY_ADD
+            || id == KEY_WASD
+            || (KEY_DELETE..KEY_DELETE + key_click::MAX_BINDINGS as u16).contains(&id)
+            || (KEY_BUTTON..KEY_BUTTON + key_click::MAX_BINDINGS as u16).contains(&id)
+        {
+            self.cancel_capture();
+            if !self.commit() {
+                return;
+            }
+            if id == KEY_ENABLE
+                && !self.settings.key_clicks.enabled
+                && (!self.hotkeys_ready || self.key_bindings_conflict())
+            {
+                self.message = self
+                    .t(
+                        "停止キーを含むショートカットと、キーの重複を確認してください。",
+                        "Check the Stop hotkey and resolve conflicting keys first.",
+                    )
+                    .into();
+                self.rebuild();
+                return;
+            }
+            match id {
+                KEY_ENABLE => self.settings.key_clicks.enabled = !self.settings.key_clicks.enabled,
+                KEY_ADD => {
+                    if self.settings.key_clicks.bindings.len() < key_click::MAX_BINDINGS {
+                        self.settings
+                            .key_clicks
+                            .bindings
+                            .push(KeyBinding::default());
+                    }
+                }
+                KEY_WASD => {
+                    let mut candidate = self.settings.key_clicks.clone();
+                    if !candidate.add_wasd() {
+                        self.message = self
+                            .t(
+                                "キーの登録は16個までです。",
+                                "You can assign up to 16 keys.",
+                            )
+                            .into();
+                    } else if candidate
+                        .bindings
+                        .iter()
+                        .filter_map(|b| b.key)
+                        .any(|key| self.key_conflict(key))
+                    {
+                        self.message = self
+                            .t(
+                                "WASDのキーが操作用ショートカットで使用中です。",
+                                "A WASD key is already used by an operation hotkey.",
+                            )
+                            .into();
+                    } else {
+                        self.settings.key_clicks = candidate;
+                    }
+                }
+                _ if id >= KEY_DELETE => {
+                    let index = (id - KEY_DELETE) as usize;
+                    if index < self.settings.key_clicks.bindings.len() {
+                        self.settings.key_clicks.bindings.remove(index);
+                    }
+                }
+                _ => {
+                    let selection = unsafe { SendMessageW(self.control(id), CB_GETCURSEL, 0, 0) };
+                    if let Some(binding) = self
+                        .settings
+                        .key_clicks
+                        .bindings
+                        .get_mut((id - KEY_BUTTON) as usize)
+                    {
+                        binding.right = selection == 1;
+                    }
+                }
+            }
+            self.save();
+            self.rebuild();
+            return;
+        }
         if id == MODE {
             let selection = unsafe { SendMessageW(self.control(MODE), CB_GETCURSEL, 0, 0) };
             if !self.commit() {
@@ -1406,6 +1995,9 @@ impl App {
         self.cancel_capture();
         match id {
             RECORD | AREA_SELECT => {
+                if let Some(controller) = &self.key_controller {
+                    controller.set_active(false);
+                }
                 self.mouse_hook = unsafe {
                     SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), GetModuleHandleW(null()), 0)
                 };
@@ -1515,27 +2107,7 @@ impl App {
             }
             id if (CAPTURE_KEY..CAPTURE_KEY + 4).contains(&id) => {
                 let i = (id - CAPTURE_KEY) as usize;
-                self.keyboard_hook = unsafe {
-                    SetWindowsHookExW(
-                        WH_KEYBOARD_LL,
-                        Some(keyboard_hook),
-                        GetModuleHandleW(null()),
-                        0,
-                    )
-                };
-                if self.keyboard_hook.is_null() {
-                    self.message = self
-                        .t(
-                            "キーの入力を監視できません。",
-                            "Cannot capture keyboard input.",
-                        )
-                        .into();
-                    set_text(self.control(MESSAGE), &self.message);
-                    return;
-                }
-                self.capturing = Some(i);
-                CAPTURE.store((i + 1) as u32, Ordering::Relaxed);
-                self.rebuild();
+                self.start_key_capture(i);
             }
             _ => {}
         }
@@ -1543,6 +2115,9 @@ impl App {
     fn start_run(&mut self, locked: bool) {
         self.clear_markers();
         self.cancel_capture();
+        if let Some(controller) = &self.key_controller {
+            controller.set_active(false);
+        }
         match Runner::start(self.settings.clone()) {
             Ok(runner) => {
                 if locked {
@@ -1629,6 +2204,55 @@ impl App {
             self.rebuild();
             return;
         }
+        if i >= ACTIONS.len() {
+            let index = i - ACTIONS.len();
+            if !key_click::supported_key(key) || mods != 0 {
+                self.message = self
+                    .t(
+                        "Wなど単独のキーを選んでください。",
+                        "Choose a single key such as W.",
+                    )
+                    .into();
+            } else if self
+                .settings
+                .key_clicks
+                .bindings
+                .iter()
+                .enumerate()
+                .any(|(other, b)| other != index && b.key == Some(key))
+                || self.key_conflict(key)
+            {
+                self.message = self
+                    .t(
+                        "そのキーは別の操作で使用中です。",
+                        "That key is already assigned.",
+                    )
+                    .into();
+            } else if let Some(binding) = self.settings.key_clicks.bindings.get_mut(index) {
+                binding.key = Some(key);
+                self.message = self.t("キーを保存しました。", "Key saved.").into();
+                self.save();
+            }
+            self.rebuild();
+            return;
+        }
+        if mods == 0
+            && self
+                .settings
+                .key_clicks
+                .bindings
+                .iter()
+                .any(|b| b.key == Some(key))
+        {
+            self.message = self
+                .t(
+                    "そのキーは位置のクリックに割り当てられています。",
+                    "That key is assigned to a position click.",
+                )
+                .into();
+            self.rebuild();
+            return;
+        }
         let Some(combo) = combo_from_key(mods, key) else {
             self.rebuild();
             return;
@@ -1673,8 +2297,10 @@ impl App {
         self.rebuild();
     }
     fn cancel_capture(&mut self) {
+        self.cancel_key_pick();
         self.capturing = None;
         CAPTURE.store(0, Ordering::Relaxed);
+        KEY_CAPTURE_STATE.with(|state| *state.borrow_mut() = key_click::KeyCapture::default());
         if !self.keyboard_hook.is_null() {
             unsafe {
                 UnhookWindowsHookEx(self.keyboard_hook);
@@ -1768,6 +2394,34 @@ fn format_hotkey(s: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" + ")
+}
+fn key_name(key: u32) -> String {
+    if !matches!(key,0x30..=0x39|0x41..=0x5a|0x60..=0x69|0x70..=0x87) {
+        let scan = unsafe { MapVirtualKeyW(key, MAPVK_VK_TO_VSC) };
+        let mut name = [0u16; 64];
+        let length =
+            unsafe { GetKeyNameTextW((scan << 16) as i32, name.as_mut_ptr(), name.len() as i32) };
+        if length > 0 && !matches!(key, 0x08 | 0x09 | 0x0d | 0x20..=0x28 | 0x2d | 0x2e) {
+            return String::from_utf16_lossy(&name[..length as usize]);
+        }
+    }
+    match key {
+        0x08 => "Backspace".into(),
+        0x09 => "Tab".into(),
+        0x0d => "Enter".into(),
+        0x20 => "Space".into(),
+        0x21 => "Page Up".into(),
+        0x22 => "Page Down".into(),
+        0x23 => "End".into(),
+        0x24 => "Home".into(),
+        0x25 => "←".into(),
+        0x26 => "↑".into(),
+        0x27 => "→".into(),
+        0x28 => "↓".into(),
+        0x2d => "Insert".into(),
+        0x2e => "Delete".into(),
+        _ => format_hotkey(&combo_from_key(0, key).unwrap_or_else(|| format!("vk{key}"))),
+    }
 }
 fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
     let parts: Vec<_> = s.split('+').collect();
@@ -1876,6 +2530,11 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
     if code >= 0 && wp == WM_LBUTTONDOWN as usize {
         // WH_MOUSE_LL supplies MSLLHOOKSTRUCT for the duration of this callback.
         let event = unsafe { &*(lp as *const MSLLHOOKSTRUCT) };
+        if event.flags & LLMHF_INJECTED != 0
+            && event.dwExtraInfo == multi_point_clicker::engine::KEY_CLICK_TAG
+        {
+            return unsafe { CallNextHookEx(null_mut(), code, wp, lp) };
+        }
         // Recording and playback are mutually exclusive. Accessibility-generated
         // clicks are valid recording input too; no synthetic input is discarded.
         {
@@ -1889,42 +2548,76 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
     }
     unsafe { CallNextHookEx(null_mut(), code, wp, lp) }
 }
+unsafe extern "system" fn key_pick_mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code >= 0 && KEY_PICKING.load(Ordering::Acquire) {
+        let event = unsafe { &*(lp as *const MSLLHOOKSTRUCT) };
+        if event.flags & LLMHF_INJECTED == 0 {
+            if wp as u32 == WM_LBUTTONDOWN {
+                KEY_PICK_ORIGIN.with(|point| *point.borrow_mut() = Some(event.pt));
+                return 1;
+            }
+            if wp as u32 == WM_LBUTTONUP
+                && KEY_PICK_ORIGIN
+                    .with(|point| point.borrow_mut().take())
+                    .is_some()
+            {
+                KEY_PICKING.store(false, Ordering::Release);
+                unsafe {
+                    PostMessageW(
+                        ROOT.load(Ordering::Relaxed) as HWND,
+                        APP_KEY_PICK,
+                        event.pt.x as usize,
+                        event.pt.y as isize,
+                    );
+                }
+                return 1;
+            }
+        }
+    }
+    unsafe { CallNextHookEx(null_mut(), code, wp, lp) }
+}
 unsafe extern "system" fn keyboard_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0
-        && CAPTURE.load(Ordering::Relaxed) != 0
-        && (wp == WM_KEYDOWN as usize || wp == WM_SYSKEYDOWN as usize)
+        && KEY_PICKING.load(Ordering::Acquire)
+        && matches!(wp as u32, WM_KEYDOWN | WM_SYSKEYDOWN)
     {
         let event = unsafe { &*(lp as *const KBDLLHOOKSTRUCT) };
-        let key = event.vkCode;
-        if ![
-            VK_LCONTROL,
-            VK_RCONTROL,
-            VK_CONTROL,
-            VK_LMENU,
-            VK_RMENU,
-            VK_MENU,
-            VK_LSHIFT,
-            VK_RSHIFT,
-            VK_SHIFT,
-            VK_LWIN,
-            VK_RWIN,
-        ]
-        .iter()
-        .any(|k| *k as u32 == key)
-        {
-            let mut mods = 0;
-            for (vk, flag) in [
-                (VK_CONTROL, MOD_CONTROL),
-                (VK_MENU, MOD_ALT),
-                (VK_SHIFT, MOD_SHIFT),
-                (VK_LWIN, MOD_WIN),
-                (VK_RWIN, MOD_WIN),
-            ] {
-                if unsafe { GetAsyncKeyState(vk as i32) } < 0 {
-                    mods |= flag;
-                }
+        if event.vkCode == VK_ESCAPE as u32 {
+            unsafe {
+                PostMessageW(ROOT.load(Ordering::Relaxed) as HWND, APP_KEY_CANCEL, 0, 0);
             }
-            CAPTURE.store(0, Ordering::Relaxed);
+            return 1;
+        }
+    }
+    if code >= 0
+        && CAPTURE.load(Ordering::Acquire) != 0
+        && matches!(
+            wp as u32,
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP
+        )
+    {
+        let event = unsafe { &*(lp as *const KBDLLHOOKSTRUCT) };
+        let mut mods = 0;
+        for (key, flag) in [
+            (VK_CONTROL, MOD_CONTROL),
+            (VK_MENU, MOD_ALT),
+            (VK_SHIFT, MOD_SHIFT),
+            (VK_LWIN, MOD_WIN),
+            (VK_RWIN, MOD_WIN),
+        ] {
+            if unsafe { GetAsyncKeyState(key as i32) } < 0 {
+                mods |= flag;
+            }
+        }
+        let (suppress, captured) = KEY_CAPTURE_STATE.with(|state| {
+            state.borrow_mut().event(
+                event.vkCode,
+                matches!(wp as u32, WM_KEYDOWN | WM_SYSKEYDOWN),
+                mods,
+            )
+        });
+        if let Some((mods, key)) = captured {
+            CAPTURE.store(0, Ordering::Release);
             unsafe {
                 PostMessageW(
                     ROOT.load(Ordering::Relaxed) as HWND,
@@ -1933,6 +2626,8 @@ unsafe extern "system" fn keyboard_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LR
                     key as isize,
                 );
             }
+        }
+        if suppress {
             return 1;
         }
     }
@@ -2085,6 +2780,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             );
             if (id == NAV_MAIN && ACTIVE_TAB.load(Ordering::Relaxed) == 0)
                 || (id == NAV_SETTINGS && ACTIVE_TAB.load(Ordering::Relaxed) == 1)
+                || (id == NAV_KEYS && ACTIVE_TAB.load(Ordering::Relaxed) == 2)
             {
                 let underline = RECT {
                     left: d.rcItem.left + 1,
@@ -2123,10 +2819,29 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 app.captured(wp as u32, lp as u32);
                 true
             }
+            APP_KEY_PICK => {
+                app.key_pick_finished(wp as i32, lp as i32);
+                true
+            }
+            APP_KEY_CANCEL => {
+                app.cancel_key_pick();
+                app.message = app
+                    .t(
+                        "位置の記憶を取り消しました。",
+                        "Position capture cancelled.",
+                    )
+                    .into();
+                app.rebuild();
+                true
+            }
             WM_COMMAND => {
                 let id = (wp & 0xffff) as u16;
                 let notification = ((wp >> 16) & 0xffff) as u32;
-                if notification == BN_CLICKED || (id == MODE && notification == CBN_SELCHANGE) {
+                if notification == BN_CLICKED
+                    || ((id == MODE
+                        || (KEY_BUTTON..KEY_BUTTON + key_click::MAX_BINDINGS as u16).contains(&id))
+                        && notification == CBN_SELCHANGE)
+                {
                     app.action(id);
                 }
                 true
@@ -2404,6 +3119,9 @@ pub fn run() -> i32 {
             wheel_remainder: 0,
             main_offset: 0,
             selecting_area: false,
+            key_controller: None,
+            key_target: None,
+            key_pick: None,
         };
         if migrated {
             app.message=app.t("旧設定とクリック位置を移行しました。間隔は0.501秒から開始します。","Previous positions and settings were imported. The interval starts at 0.501 seconds.").into();
@@ -2451,6 +3169,9 @@ pub fn run() -> i32 {
                 }
                 if !app.keyboard_hook.is_null() {
                     UnhookWindowsHookEx(app.keyboard_hook);
+                }
+                if let Some(mut controller) = app.key_controller.take() {
+                    controller.stop();
                 }
                 DeleteObject(app.font);
                 DeleteObject(app.title_font);
@@ -2714,6 +3435,106 @@ pub fn input_probe(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn key_clicks_refuse_enable_without_a_registered_stop_and_show_custom_stop() {
+        let mut fixture = TestApp::new();
+        let app = &mut fixture.app;
+        app.action(NAV_KEYS);
+        app.action(KEY_WASD);
+        assert!(app.register_hotkeys_using(|_, _, _| false).is_err());
+        app.rebuild();
+        app.action(KEY_ENABLE);
+        assert!(!app.settings.key_clicks.enabled);
+        assert!(app.key_controller.is_none());
+        assert_eq!(unsafe { IsWindowEnabled(app.control(KEY_ENABLE)) }, 0);
+        app.hotkeys_ready = true;
+        app.settings
+            .hotkeys
+            .insert("click_stop".into(), "f8".into());
+        app.rebuild();
+        assert!(text(app.control(KEY_STATUS)).contains("F8"));
+        app.action(KEY_ENABLE);
+        assert!(app.settings.key_clicks.enabled);
+    }
+    #[test]
+    fn wasd_preset_keeps_the_existing_map_when_an_operation_key_conflicts() {
+        let mut fixture = TestApp::new();
+        let app = &mut fixture.app;
+        app.settings
+            .hotkeys
+            .insert("click_start".into(), "w".into());
+        app.action(NAV_KEYS);
+        app.action(KEY_WASD);
+        assert!(app.settings.key_clicks.bindings.is_empty());
+        assert_eq!(app.settings.hotkeys["click_start"], "w");
+        app.action(KEY_ADD);
+        app.capturing = Some(ACTIONS.len());
+        app.captured(0, b'W' as u32);
+        assert_eq!(app.settings.key_clicks.bindings[0].key, None);
+        app.settings.key_clicks.bindings[0].key = Some(b'W' as u32);
+        app.action(KEY_ENABLE);
+        assert!(!app.settings.key_clicks.enabled);
+        assert!(app.key_bindings_conflict());
+    }
+    #[test]
+    fn key_click_controls_save_independent_wasd_and_preserve_other_settings() {
+        let mut fixture = TestApp::new();
+        let app = &mut fixture.app;
+        app.settings.delay_ms = 7000;
+        app.settings.points.push(Point {
+            x: 31,
+            y: 42,
+            interval_ticks: Some(1),
+        });
+        app.action(NAV_KEYS);
+        assert_eq!(app.tab, 2);
+        app.action(KEY_WASD);
+        assert_eq!(app.settings.key_clicks.bindings.len(), 4);
+        let game = key_click::GameIdentity {
+            executable: "C:/Games/example.exe".into(),
+            class: "ExampleWindow".into(),
+            title: "Example".into(),
+        };
+        app.settings.key_clicks.last_target = Some(game.clone());
+        for (binding, (x, y)) in app.settings.key_clicks.bindings.iter_mut().zip([
+            (180, 690),
+            (140, 730),
+            (180, 770),
+            (220, 730),
+        ]) {
+            binding.position = Some(key_click::ClientPoint {
+                game: game.clone(),
+                x,
+                y,
+                width: 1280,
+                height: 900,
+            });
+        }
+        app.capturing = Some(ACTIONS.len() + 1);
+        app.captured(0, b'W' as u32);
+        assert_eq!(app.settings.key_clicks.bindings[1].key, Some(b'A' as u32));
+        app.capturing = Some(ACTIONS.len() + 1);
+        app.captured(0, b'E' as u32);
+        assert_eq!(app.settings.key_clicks.bindings[1].key, Some(b'E' as u32));
+        unsafe {
+            SendMessageW(app.control(KEY_BUTTON), CB_SETCURSEL, 1, 0);
+        }
+        app.action(KEY_BUTTON);
+        assert!(app.settings.key_clicks.bindings[0].right);
+        app.action(KEY_ENABLE);
+        assert!(app.settings.key_clicks.enabled);
+        assert!(app.key_controller.is_none());
+        let (loaded, _) = Settings::load(&app.path).unwrap();
+        assert_eq!(loaded.key_clicks, app.settings.key_clicks);
+        assert_eq!(loaded.delay_ms, 7000);
+        assert_eq!(loaded.points, app.settings.points);
+        app.action(KEY_DELETE + 1);
+        assert_eq!(app.settings.key_clicks.bindings.len(), 3);
+        app.action(NAV_SETTINGS);
+        assert_eq!(text(app.control(DELAY)), "7");
+        app.action(NAV_MAIN);
+        assert_eq!(app.settings.points[0].interval_ticks, Some(1));
+    }
     struct TestApp {
         app: App,
         dir: PathBuf,
@@ -2780,6 +3601,9 @@ mod tests {
                 wheel_remainder: 0,
                 main_offset: 0,
                 selecting_area: false,
+                key_controller: None,
+                key_target: None,
+                key_pick: None,
             };
             let mut fixture = Self { app, dir };
             fixture.app.rebuild();

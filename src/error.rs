@@ -2,6 +2,8 @@ use serde::Serialize;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum ErrorCode {
+    KeyMapping,
+    KeyTarget,
     AreaMissing,
     AreaInvalid,
     InputMonitor,

@@ -101,6 +101,7 @@ pub struct Settings {
     pub area: Option<ClickArea>,
     pub area_step_px: u32,
     pub fast_interval_ticks: u64,
+    pub key_clicks: crate::key_click::KeyClickSettings,
 }
 
 #[derive(Deserialize)]
@@ -159,6 +160,7 @@ impl Default for Settings {
             area: None,
             area_step_px: 30,
             fast_interval_ticks: TICKS_PER_MILLISECOND,
+            key_clicks: crate::key_click::KeyClickSettings::default(),
         }
     }
 }
@@ -176,6 +178,7 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<(), ClickerError> {
+        self.key_clicks.validate()?;
         if !(MIN_INTERVAL_TICKS..=MAX_INTERVAL_TICKS).contains(&self.fast_interval_ticks) {
             return Err(ErrorCode::IntervalRange.into());
         }
