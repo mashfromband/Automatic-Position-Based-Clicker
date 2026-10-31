@@ -5,8 +5,14 @@ Pythonや追加のGUIランタイムは必要ありません。日本語/English
 
 ## 起動
 
-`multi-point-clicker.exe` を開きます。このPCでは、フォルダ内の **Multi Point Clicker.lnk** から起動できます。
+デスクトップの **Multi Point Clicker** から起動します。
+配布ZIPを使う場合は、展開した **Multi Point Clicker.exe** を開いてください。
 Terminalの窓は開きません。再び起動しても、同じアプリのウィンドウを表示します。
+
+起動時にGitHubの最新の安定版を確認し、更新があれば自動で取得してから開きます。
+通信できない場合は、手元の版を使います。
+新版が起動できない場合は、直前に使えていたアプリと設定の組み合わせへ自動で戻します。
+[自動更新と復元の仕組み](docs/automatic-updates.md)も参照してください。
 
 ## 使い方
 
@@ -60,7 +66,10 @@ Terminalの窓は開きません。再び起動しても、同じアプリのウ
 
 ## 保存と旧版からの移行
 
-設定は `%APPDATA%\MultiPointClicker\settings.json` に保存します。
+自動更新する起動方法では、設定を `%LOCALAPPDATA%\MultiPointClicker\data\<識別子>\MultiPointClicker\settings.json` に保存します。
+使用中の識別子は `%LOCALAPPDATA%\MultiPointClicker\state.json` の `current.data` に記録します。
+初回は従来の `%APPDATA%\MultiPointClicker` の設定とバックアップをコピーし、元のファイルは残します。
+`multi-point-clicker.exe` を直接開いた場合は、従来の保存先を使い、自動更新は行いません。
 初回のRust版起動時には、旧設定を `settings.python-backup.json` にバックアップし、クリック位置・周回数・ショートカットなどを引き継ぎます。
 初回移行時の共通間隔は0.501秒です。以後は保存した間隔を保持します。
 以前のRust版のミリ秒設定は100ns単位の整数へ正確に変換し、`settings.v2-backup.json`へ元ファイルを保全します。
@@ -77,7 +86,7 @@ cargo test --locked --workspace --doc
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-実行ファイルは `target/release/multi-point-clicker.exe` に生成されます。
+アプリ本体は `target/release/multi-point-clicker.exe`、起動と更新を行う実行ファイルは `target/release/clicker-launcher.exe` に生成されます。
 クリックはGUIと独立したスレッドからWindowsのSendInputで送り、待機には高分解能タイマーと最大150µsの最終待機を使います。
 記録用マウス監視は位置の記録中だけ動作します。
 

@@ -1,15 +1,16 @@
 [package]
 name = "multi-point-clicker"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
 rust-version = "1.85"
-description = "A native Windows multi-point clicker with millisecond timing"
+description = "A native Windows multi-point clicker with automatic updates"
 
 [workspace]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 
 [build-dependencies]
 embed-resource = "3.0"
@@ -21,7 +22,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Registry", "Win32_System_SystemInformation",
     "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_HiDpi", "Win32_UI_Controls", "Win32_Storage_FileSystem",
-    "Win32_Globalization"
+    "Win32_Globalization", "Win32_Networking_WinHttp", "Win32_System_JobObjects"
 ] }
 
 [profile.release]
