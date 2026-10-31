@@ -3,6 +3,7 @@ use std::{
     cell::RefCell,
     mem::{size_of, zeroed},
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    panic::{AssertUnwindSafe, catch_unwind},
     ptr::{null, null_mut},
     sync::{
         Arc, Mutex, RwLock,
@@ -10,6 +11,7 @@ use std::{
         mpsc::{self, SyncSender},
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::*,
@@ -219,6 +221,7 @@ struct Request {
     snapshot: Arc<Snapshot>,
     generation: u64,
     index: usize,
+    created: Instant,
 }
 struct Shared {
     snapshot: RwLock<Arc<Snapshot>>,
@@ -231,7 +234,7 @@ struct Shared {
     output: Mutex<()>,
 }
 impl Shared {
-    fn current(&self, request: &Request) -> bool {
+    fn valid(&self, request: &Request) -> bool {
         self.active.load(Ordering::Acquire)
             && self.desired.load(Ordering::Acquire)
             && !self.stopping.load(Ordering::Acquire)
@@ -240,6 +243,9 @@ impl Shared {
                 .snapshot
                 .read()
                 .is_ok_and(|snapshot| Arc::ptr_eq(&snapshot, &request.snapshot))
+    }
+    fn current(&self, request: &Request) -> bool {
+        self.valid(request) && request.created.elapsed() <= Duration::from_millis(250)
     }
     fn report(&self, error: ClickerError) {
         if let Ok(mut slot) = self.error.lock() {
@@ -267,6 +273,24 @@ fn dispatch(
     resolve: impl FnOnce() -> Result<Option<(i32, i32, bool)>, ClickerError>,
     emit: impl FnOnce(i32, i32, bool) -> Result<bool, ClickerError>,
 ) -> Result<bool, ClickerError> {
+    match catch_unwind(AssertUnwindSafe(|| {
+        dispatch_inner(shared, request, resolve, emit)
+    })) {
+        Ok(result) => result,
+        Err(_) => {
+            shared.active.store(false, Ordering::Release);
+            shared.desired.store(false, Ordering::Release);
+            shared.generation.fetch_add(1, Ordering::AcqRel);
+            Err(ErrorCode::WorkerPanic.into())
+        }
+    }
+}
+fn dispatch_inner(
+    shared: &Shared,
+    request: &Request,
+    resolve: impl FnOnce() -> Result<Option<(i32, i32, bool)>, ClickerError>,
+    emit: impl FnOnce(i32, i32, bool) -> Result<bool, ClickerError>,
+) -> Result<bool, ClickerError> {
     if !shared.current(request) {
         return Ok(false);
     }
@@ -288,6 +312,13 @@ fn dispatch(
         shared.clicks.fetch_add(1, Ordering::Relaxed);
     }
     Ok(clicked)
+}
+fn allowed_during_pulse(
+    shared: &Shared,
+    request: &Request,
+    foreground: impl FnOnce() -> bool,
+) -> bool {
+    shared.valid(request) && foreground()
 }
 thread_local! {static CONTEXT:RefCell<Option<Context>>=const {RefCell::new(None)};}
 unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -334,6 +365,7 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
                         snapshot,
                         generation,
                         index,
+                        created: Instant::now(),
                     };
                     if context.sender.try_send(request).is_err() {
                         shared.report(ErrorCode::InputSend.into());
@@ -368,7 +400,7 @@ impl Controller {
             error: Mutex::new(None),
             output: Mutex::new(()),
         });
-        let (sender, receiver) = mpsc::sync_channel::<Request>(64);
+        let (sender, receiver) = mpsc::sync_channel::<Request>(8);
         let worker_shared = shared.clone();
         let worker = thread::Builder::new()
             .name("key-click-input".into())
@@ -399,8 +431,15 @@ impl Controller {
                             {
                                 return Ok(false);
                             }
-                            crate::engine::click_once_restore(x, y, right)?;
-                            Ok(true)
+                            crate::engine::click_once_restore(x, y, right, || {
+                                allowed_during_pulse(&worker_shared, &request, || {
+                                    request
+                                        .snapshot
+                                        .target
+                                        .as_ref()
+                                        .is_some_and(|target| target.foreground())
+                                })
+                            })
                         },
                     );
                     if let Err(error) = result {
@@ -603,6 +642,7 @@ mod tests {
             snapshot: snapshot.clone(),
             generation: 1,
             index: 0,
+            created: Instant::now(),
         };
         let emitted = Mutex::new(Vec::new());
         let send = |x, y, right| {
@@ -638,6 +678,7 @@ mod tests {
             snapshot,
             generation: shared.generation.load(Ordering::Acquire),
             index: 0,
+            created: Instant::now(),
         };
         assert!(
             !dispatch(
@@ -652,12 +693,49 @@ mod tests {
             snapshot: shared.snapshot.read().unwrap().clone(),
             generation: shared.generation.load(Ordering::Acquire),
             index: 0,
+            created: Instant::now(),
         };
+        let expired = Request {
+            snapshot: current.snapshot.clone(),
+            generation: current.generation,
+            index: 0,
+            created: Instant::now() - Duration::from_secs(1),
+        };
+        assert!(
+            !dispatch(
+                &shared,
+                &expired,
+                || panic!("expired request reached resolver"),
+                send
+            )
+            .unwrap()
+        );
+        // Once a pulse starts, aging alone must not cut its 50ms hold short.
+        assert!(allowed_during_pulse(&shared, &expired, || true));
+        assert!(!allowed_during_pulse(&shared, &expired, || false));
         assert!(dispatch(&shared, &current, || Ok(Some((340, 450, true))), send).unwrap());
+        let panic = dispatch(
+            &shared,
+            &current,
+            || panic!("resolver failure fixture"),
+            send,
+        )
+        .unwrap_err();
+        assert_eq!(panic.code, ErrorCode::WorkerPanic);
+        assert!(!shared.active.load(Ordering::Acquire));
+        shared.active.store(true, Ordering::Release);
+        shared.desired.store(true, Ordering::Release);
+        let resumed = Request {
+            snapshot: current.snapshot.clone(),
+            generation: shared.generation.load(Ordering::Acquire),
+            index: 0,
+            created: Instant::now(),
+        };
+        assert!(dispatch(&shared, &resumed, || Ok(Some((560, 670, false))), send).unwrap());
         assert_eq!(
             *emitted.lock().unwrap(),
-            [(120, 230, false), (340, 450, true)]
+            [(120, 230, false), (340, 450, true), (560, 670, false)]
         );
-        assert_eq!(shared.clicks.load(Ordering::Relaxed), 2);
+        assert_eq!(shared.clicks.load(Ordering::Relaxed), 3);
     }
 }
