@@ -2,6 +2,8 @@
 #[cfg(windows)]
 mod http;
 #[cfg(windows)]
+pub mod process;
+#[cfg(windows)]
 pub mod runtime;
 
 use serde::{Deserialize, Serialize};
@@ -37,6 +39,16 @@ pub fn unique_id() -> String {
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct Version(pub u32, pub u32, pub u32);
+
+pub fn epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+pub fn startup_grace(confirmed_at: u64, now: u64) -> bool {
+    confirmed_at > 0 && now >= confirmed_at && now - confirmed_at <= 60
+}
 
 impl Version {
     pub fn parse(text: &str) -> io::Result<Self> {
@@ -114,6 +126,8 @@ impl Binary {
 pub struct Installation {
     pub binary: Binary,
     pub data: String,
+    #[serde(default)]
+    pub settings_expected: bool,
 }
 
 impl Installation {
@@ -141,6 +155,14 @@ impl Installation {
         if !metadata.is_dir() || is_link(&metadata) {
             return Err(invalid("Installed application data is missing"));
         }
+        let app_data = self.data_root(root).join("MultiPointClicker");
+        let metadata = fs::symlink_metadata(&app_data)?;
+        if !metadata.is_dir()
+            || is_link(&metadata)
+            || (self.settings_expected && !app_data.join("settings.json").is_file())
+        {
+            return Err(invalid("Previously saved application settings are missing"));
+        }
         Ok(())
     }
 }
@@ -158,6 +180,12 @@ pub struct State {
     pub staged: Option<Binary>,
     pub pending: Option<Pending>,
     pub rejected: Option<String>,
+    #[serde(default)]
+    pub confirmed_at: u64,
+    #[serde(default)]
+    pub timeout_candidate: Option<String>,
+    #[serde(default)]
+    pub timeout_failures: u32,
 }
 
 impl State {
@@ -210,6 +238,7 @@ pub fn initialize(root: &Path, legacy_data: &Path) -> io::Result<State> {
     let current = Installation {
         binary: setup.previous.clone().unwrap_or_else(|| setup.seed.clone()),
         data: unique_id(),
+        settings_expected: legacy_data.join("settings.json").is_file(),
     };
     let data_path = current.data_root(root).join("MultiPointClicker");
     copy_data(legacy_data, &data_path)?;
@@ -220,6 +249,9 @@ pub fn initialize(root: &Path, legacy_data: &Path) -> io::Result<State> {
         staged: setup.previous.map(|_| setup.seed),
         pending: None,
         rejected: None,
+        confirmed_at: 0,
+        timeout_candidate: None,
+        timeout_failures: 0,
     };
     state.save(root)?;
     Ok(state)
@@ -232,14 +264,85 @@ pub fn stage_binary(root: &Path, binary: &Binary, bytes: &[u8]) -> io::Result<()
     }
     let destination = binary.path(root);
     if destination.exists() && binary.verify(root).is_ok() {
-        return Ok(());
+        return atomic_json(&destination.with_file_name("binary.json"), binary);
     }
     fs::create_dir_all(
         destination
             .parent()
             .ok_or_else(|| invalid("Missing executable parent"))?,
     )?;
-    atomic_bytes(&destination, bytes)
+    atomic_bytes(&destination, bytes)?;
+    atomic_json(&destination.with_file_name("binary.json"), binary)
+}
+
+/// Only remove our two known binary files; retain all application data and unknown files.
+pub fn clean_versions(root: &Path, state: &State) {
+    let mut keep = std::collections::BTreeSet::new();
+    let mut add = |state: &State| {
+        keep.insert(state.current.binary.id());
+        if let Some(pair) = &state.previous {
+            keep.insert(pair.binary.id());
+        }
+        if let Some(binary) = &state.staged {
+            keep.insert(binary.id());
+        }
+        if let Some(pending) = &state.pending {
+            keep.insert(pending.trial.binary.id());
+        }
+    };
+    add(state);
+    if let Ok(bytes) = fs::read(root.join("state-backup.json")) {
+        if let Ok(backup) = State::decode(&bytes) {
+            add(&backup);
+        }
+    }
+    if let Ok(bytes) = fs::read(root.join("bootstrap.json")) {
+        if let Ok(setup) = serde_json::from_slice::<Bootstrap>(&bytes) {
+            if setup.seed.validate().is_ok() {
+                keep.insert(setup.seed.id());
+            }
+            if let Some(previous) = setup.previous.filter(|b| b.validate().is_ok()) {
+                keep.insert(previous.id());
+            }
+        }
+    }
+    let Ok(entries) = fs::read_dir(root.join("versions")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if keep.contains(&name) {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() || is_link(&metadata) {
+            continue;
+        }
+        let marker = path.join("binary.json");
+        let Ok(metadata) = fs::symlink_metadata(&marker) else {
+            continue;
+        };
+        if is_link(&metadata) {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&marker) else {
+            continue;
+        };
+        let Ok(binary) = serde_json::from_slice::<Binary>(&bytes) else {
+            continue;
+        };
+        if binary.validate().is_err() || binary.id() != name {
+            continue;
+        }
+        if fs::remove_file(path.join("multi-point-clicker.exe")).is_err() {
+            continue;
+        }
+        let _ = fs::remove_file(marker);
+        let _ = fs::remove_dir(path);
+    }
 }
 
 pub trait AppRuntime {
@@ -247,6 +350,23 @@ pub trait AppRuntime {
     /// A failure must leave no trial process running or writing application data.
     fn start(&mut self, pair: &Installation, root: &Path) -> io::Result<Self::Session>;
     fn stop(&mut self, session: Self::Session) -> io::Result<()>;
+}
+
+#[derive(Debug)]
+pub struct CleanupUnconfirmed(pub io::Error);
+impl std::fmt::Display for CleanupUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Application termination is unconfirmed: {}", self.0)
+    }
+}
+impl std::error::Error for CleanupUnconfirmed {}
+pub fn cleanup_error(error: io::Error) -> io::Error {
+    io::Error::other(CleanupUnconfirmed(error))
+}
+fn is_cleanup_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|e| e.is::<CleanupUnconfirmed>())
 }
 
 /// Recover first, so a terminated launcher cannot repeatedly try the same broken update.
@@ -272,9 +392,10 @@ pub fn start<R: AppRuntime>(
         let attempt = (|| {
             binary.verify(root)?;
             state.current.verify(root)?;
-            let trial = Installation {
+            let mut trial = Installation {
                 binary,
                 data: unique_id(),
+                settings_expected: state.current.settings_expected,
             };
             copy_data(&state.current.data_root(root), &trial.data_root(root))?;
             state.pending = Some(Pending {
@@ -283,13 +404,24 @@ pub fn start<R: AppRuntime>(
             state.save(root)?;
             attempted_startup = true;
             let session = runtime.start(&trial, root)?;
+            trial.settings_expected |= trial
+                .data_root(root)
+                .join("MultiPointClicker/settings.json")
+                .is_file();
+            if let Err(error) = trial.verify(root) {
+                runtime.stop(session).map_err(cleanup_error)?;
+                return Err(error);
+            }
             let mut committed = state.clone();
             committed.previous = Some(state.current.clone());
             committed.current = trial;
             committed.staged = None;
             committed.pending = None;
+            committed.confirmed_at = epoch_seconds();
+            committed.timeout_candidate = None;
+            committed.timeout_failures = 0;
             if let Err(error) = committed.save(root) {
-                runtime.stop(session)?;
+                runtime.stop(session).map_err(cleanup_error)?;
                 return Err(error);
             }
             *state = committed;
@@ -297,6 +429,7 @@ pub fn start<R: AppRuntime>(
         })();
         match attempt {
             Ok(session) => return Ok(session),
+            Err(error) if is_cleanup_error(&error) => return Err(error),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 state.pending = None;
                 state.save(root)?;
@@ -305,8 +438,17 @@ pub fn start<R: AppRuntime>(
             Err(error) => {
                 log(root, "rolled_back", &error.to_string());
                 if attempted_startup {
-                    state.rejected = state.staged.as_ref().map(|b| b.sha256.clone());
-                    state.staged = None;
+                    let hash = state.staged.as_ref().map(|b| b.sha256.clone());
+                    let retry_timeout = error.kind() == io::ErrorKind::TimedOut
+                        && (state.timeout_candidate != hash || state.timeout_failures == 0);
+                    if retry_timeout {
+                        state.timeout_candidate = hash;
+                        state.timeout_failures = 1;
+                    } else {
+                        state.rejected = hash;
+                        state.staged = None;
+                        state.timeout_failures = 2;
+                    }
                 }
                 state.pending = None;
                 // The saved current still names the old pair if this write fails.
@@ -322,6 +464,7 @@ pub fn start<R: AppRuntime>(
         .and_then(|_| runtime.start(&state.current, root));
     match current_result {
         Ok(session) => Ok(session),
+        Err(error) if is_cleanup_error(&error) => Err(error),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(error),
         Err(error) => {
             let Some(previous) = state.previous.clone() else {
@@ -336,9 +479,10 @@ pub fn start<R: AppRuntime>(
             restored.previous = None;
             restored.staged = None;
             restored.pending = None;
+            restored.confirmed_at = 0;
             if let Err(error) = restored.save(root) {
                 // Never leave an untracked process alive if restoring the selector fails.
-                runtime.stop(session)?;
+                runtime.stop(session).map_err(cleanup_error)?;
                 return Err(error);
             }
             *state = restored;

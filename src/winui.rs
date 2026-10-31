@@ -2413,6 +2413,9 @@ pub fn run() -> i32 {
             app.message=if migrated {app.t("クリック位置と旧設定を移行し、未対応または重複したキーを修正しました（間隔は0.501秒から開始します）。","Imported positions and settings, repaired unsupported or duplicate hotkeys, and set the interval to 0.501 seconds.")}else{app.t("未対応または重複した旧キーを利用可能な初期キーに変更しました。設定で確認できます。","Unsupported or duplicate legacy hotkeys were reset to available defaults. Check Settings.")}.into();
             app.save();
         }
+        if new_settings && multi_point_clicker::startup::managed() {
+            app.save();
+        }
         if let Err(e) = app.register_hotkeys() {
             app.message = e;
         }

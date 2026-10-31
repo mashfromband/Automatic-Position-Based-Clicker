@@ -29,6 +29,7 @@ fn installed(root: &Path, version: &str, data: &str) -> Installation {
     let pair = Installation {
         binary,
         data: unique_id(),
+        settings_expected: true,
     };
     let path = pair.data_root(root).join("MultiPointClicker");
     fs::create_dir_all(&path).unwrap();
@@ -44,6 +45,9 @@ fn state(current: Installation, staged: Option<Binary>) -> State {
         staged,
         pending: None,
         rejected: None,
+        confirmed_at: 0,
+        timeout_candidate: None,
+        timeout_failures: 0,
     }
 }
 
@@ -189,6 +193,112 @@ fn missing_current_data_falls_back_instead_of_resetting_settings() {
 }
 
 #[test]
+fn missing_settings_file_or_inner_directory_restores_the_old_data_pair() {
+    for remove_directory in [false, true] {
+        let temp = Temp::new();
+        let old = installed(&temp.0, "2.1.0", "original settings");
+        let current = installed(&temp.0, "2.2.0", "new settings");
+        let folder = current.data_root(&temp.0).join("MultiPointClicker");
+        if remove_directory {
+            fs::remove_dir_all(&folder).unwrap();
+        } else {
+            fs::remove_file(folder.join("settings.json")).unwrap();
+        }
+        let mut state = state(current, None);
+        state.previous = Some(old.clone());
+        state.save(&temp.0).unwrap();
+        let launched = start(&temp.0, &mut state, &mut FakeRuntime::default()).unwrap();
+        assert_eq!(launched, old);
+        assert_eq!(
+            fs::read(
+                launched
+                    .data_root(&temp.0)
+                    .join("MultiPointClicker/settings.json")
+            )
+            .unwrap(),
+            b"original settings"
+        );
+    }
+}
+
+#[test]
+fn transient_startup_timeout_is_retried_once_then_rejected() {
+    struct TimeoutRuntime;
+    impl AppRuntime for TimeoutRuntime {
+        type Session = ();
+        fn start(&mut self, pair: &Installation, _: &Path) -> io::Result<()> {
+            if pair.binary.version == Version(2, 2, 0) {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "slow startup"))
+            } else {
+                Ok(())
+            }
+        }
+        fn stop(&mut self, _: ()) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let temp = Temp::new();
+    let old = installed(&temp.0, "2.1.0", "old");
+    let candidate = binary(&temp.0, "2.2.0", b"new");
+    let mut state = state(old.clone(), Some(candidate.clone()));
+    state.save(&temp.0).unwrap();
+    start(&temp.0, &mut state, &mut TimeoutRuntime).unwrap();
+    assert!(state.rejected.is_none());
+    assert!(state.staged.is_some());
+    start(&temp.0, &mut state, &mut TimeoutRuntime).unwrap();
+    assert_eq!(state.rejected, Some(candidate.sha256));
+    assert!(state.staged.is_none());
+    assert_eq!(state.current, old);
+}
+
+#[test]
+fn rollback_grace_does_not_include_later_normal_use_or_clock_reversal() {
+    assert!(startup_grace(1000, 1001));
+    assert!(startup_grace(1000, 1060));
+    assert!(!startup_grace(1000, 1061));
+    assert!(!startup_grace(0, 10));
+    assert!(!startup_grace(1000, 999));
+}
+
+#[test]
+fn old_binary_cleanup_preserves_recovery_versions_all_data_and_unknown_files() {
+    let temp = Temp::new();
+    let obsolete = installed(&temp.0, "2.0.0", "retained user settings");
+    let current = installed(&temp.0, "2.2.0", "current settings");
+    let previous = installed(&temp.0, "2.1.0", "previous settings");
+    let seed = binary(&temp.0, "2.0.1", b"original installer");
+    atomic_json(
+        &temp.0.join("bootstrap.json"),
+        &Bootstrap {
+            seed: seed.clone(),
+            previous: None,
+        },
+    )
+    .unwrap();
+    let mut state = state(current.clone(), None);
+    state.previous = Some(previous.clone());
+    state.save(&temp.0).unwrap();
+    let unknown = temp.0.join("versions/custom");
+    fs::create_dir_all(&unknown).unwrap();
+    fs::write(unknown.join("important"), b"keep").unwrap();
+    clean_versions(&temp.0, &state);
+    assert!(!obsolete.binary.path(&temp.0).exists());
+    for binary in [&current.binary, &previous.binary, &seed] {
+        assert!(binary.path(&temp.0).is_file());
+    }
+    assert_eq!(
+        fs::read(
+            obsolete
+                .data_root(&temp.0)
+                .join("MultiPointClicker/settings.json")
+        )
+        .unwrap(),
+        b"retained user settings"
+    );
+    assert_eq!(fs::read(unknown.join("important")).unwrap(), b"keep");
+}
+
+#[test]
 fn corrupt_state_can_read_the_previous_atomic_selector() {
     let temp = Temp::new();
     let old = installed(&temp.0, "2.1.0", "data");
@@ -299,12 +409,11 @@ mod processes {
         time::Duration,
     };
 
-    fn fixture(
+    fn raw_fixture(
         pair: &Installation,
         root: &Path,
         behavior: &str,
-        timeout: Duration,
-    ) -> io::Result<Child> {
+    ) -> io::Result<(Child, PathBuf, String)> {
         let report = root.join(format!("ready-{}.json", unique_id()));
         let token = unique_id();
         let child = Command::new(std::env::current_exe()?)
@@ -323,6 +432,15 @@ mod processes {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
+        Ok((child, report, token))
+    }
+    fn fixture(
+        pair: &Installation,
+        root: &Path,
+        behavior: &str,
+        timeout: Duration,
+    ) -> io::Result<Child> {
+        let (child, report, token) = raw_fixture(pair, root, behavior)?;
         runtime::supervise(child, &report, &token, &pair.binary, timeout)
     }
 
@@ -331,6 +449,49 @@ mod processes {
         let Ok(behavior) = std::env::var("MPC_FIXTURE_BEHAVIOR") else {
             return;
         };
+        if behavior == "job-parent" {
+            use crate::updater::process::{self, ObservedProcess};
+            let root = PathBuf::from(std::env::var_os("APPDATA").unwrap());
+            let exe = std::env::current_exe().unwrap();
+            let child = process::spawn(
+                &exe,
+                &[
+                    "--exact".into(),
+                    "updater::tests::processes::child_process_fixture".into(),
+                    "--nocapture".into(),
+                ],
+                exe.parent().unwrap(),
+                &[("MPC_FIXTURE_BEHAVIOR".into(), Some("spawn-hang".into()))],
+            )
+            .unwrap();
+            atomic_json(&root.join("job-child.json"), &child.id()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while !root.join("exit-parent").exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Exit without destructors: the OS must close the job and kill both descendants.
+            std::process::exit(23);
+        }
+        if behavior == "spawn-hang" {
+            let root = PathBuf::from(std::env::var_os("APPDATA").unwrap());
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "updater::tests::processes::child_process_fixture",
+                    "--nocapture",
+                ])
+                .env("MPC_FIXTURE_BEHAVIOR", "hang")
+                .creation_flags(0x0800_0000)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            atomic_json(&root.join("job-grandchild.json"), &child.id()).unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+            let _ = child.wait();
+            return;
+        }
         if behavior == "mutate-fail" {
             let path = PathBuf::from(std::env::var_os("APPDATA").unwrap())
                 .join("MultiPointClicker/settings.json");
@@ -361,6 +522,7 @@ mod processes {
     struct Processes {
         starts: Vec<Installation>,
         bad_version: Version,
+        old_behavior: &'static str,
     }
     impl AppRuntime for Processes {
         type Session = Child;
@@ -372,13 +534,15 @@ mod processes {
                 if pair.binary.version == self.bad_version {
                     "mutate-fail"
                 } else {
-                    "ready-close"
+                    self.old_behavior
                 },
                 Duration::from_secs(2),
             )
         }
         fn stop(&mut self, mut child: Child) -> io::Result<()> {
-            child.kill()?;
+            if child.try_wait()?.is_none() {
+                child.kill()?;
+            }
             child.wait()?;
             Ok(())
         }
@@ -394,6 +558,7 @@ mod processes {
         let mut runtime = Processes {
             starts: vec![],
             bad_version: Version(2, 2, 0),
+            old_behavior: "ready-close",
         };
         let mut restored = start(&temp.0, &mut state, &mut runtime).unwrap();
         assert!(restored.wait().unwrap().success());
@@ -429,5 +594,113 @@ mod processes {
         // A normal user close after reporting ready is a successful startup.
         let mut child = fixture(&pair, &temp.0, "ready-close", Duration::from_secs(2)).unwrap();
         assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn abnormal_fallback_and_missing_fallback_report_errors_without_loops() {
+        for has_previous in [false, true] {
+            let temp = Temp::new();
+            let current = installed(&temp.0, "2.2.0", "new data");
+            let mut state = state(current.clone(), None);
+            state.confirmed_at = epoch_seconds();
+            if has_previous {
+                let mut old = installed(&temp.0, "2.1.0", "old data");
+                old.binary.protocol = 0;
+                state.previous = Some(old);
+            }
+            state.save(&temp.0).unwrap();
+            let (child, _, _) = raw_fixture(&current, &temp.0, "ready-crash").unwrap();
+            let mut runtime = Processes {
+                starts: vec![],
+                bad_version: Version(99, 0, 0),
+                old_behavior: "ready-crash",
+            };
+            assert!(runtime::finish(&temp.0, &mut state, child, &mut runtime).is_err());
+            assert_eq!(runtime.starts.len(), usize::from(has_previous));
+        }
+    }
+
+    #[test]
+    fn normal_close_and_late_crash_keep_recent_settings_and_current_version() {
+        for behavior in ["ready-close", "ready-crash"] {
+            let temp = Temp::new();
+            let current = installed(&temp.0, "2.2.0", "recent settings");
+            let old = installed(&temp.0, "2.1.0", "old settings");
+            let mut state = state(current.clone(), None);
+            state.previous = Some(old);
+            state.confirmed_at = epoch_seconds().saturating_sub(61);
+            state.save(&temp.0).unwrap();
+            let (child, _, _) = raw_fixture(&current, &temp.0, behavior).unwrap();
+            let mut runtime = Processes {
+                starts: vec![],
+                bad_version: Version(99, 0, 0),
+                old_behavior: "ready-close",
+            };
+            let result = runtime::finish(&temp.0, &mut state, child, &mut runtime);
+            assert_eq!(result.is_ok(), behavior == "ready-close");
+            assert!(runtime.starts.is_empty());
+            assert_eq!(state.current, current);
+            assert!(state.rejected.is_none());
+            assert_eq!(
+                fs::read(
+                    current
+                        .data_root(&temp.0)
+                        .join("MultiPointClicker/settings.json")
+                )
+                .unwrap(),
+                b"recent settings"
+            );
+        }
+    }
+
+    #[test]
+    fn launcher_termination_kills_unconfirmed_application_and_its_descendant() {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::{
+            Foundation::WAIT_OBJECT_0,
+            System::Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+                WaitForSingleObject,
+            },
+        };
+        struct Parent(Child);
+        impl Drop for Parent {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let temp = Temp::new();
+        let pair = installed(&temp.0, "2.2.0", "data");
+        let root = pair.data_root(&temp.0);
+        let (child, _, _) = raw_fixture(&pair, &temp.0, "job-parent").unwrap();
+        let mut parent = Parent(child);
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while !root.join("job-grandchild.json").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let handles: Vec<_> = ["job-child.json", "job-grandchild.json"]
+            .into_iter()
+            .map(|name| {
+                let pid: u32 = serde_json::from_slice(&fs::read(root.join(name)).unwrap()).unwrap();
+                let raw = unsafe {
+                    OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                        0,
+                        pid,
+                    )
+                };
+                assert!(!raw.is_null());
+                unsafe { OwnedHandle::from_raw_handle(raw) }
+            })
+            .collect();
+        fs::write(root.join("exit-parent"), b"exit").unwrap();
+        assert_eq!(parent.0.wait().unwrap().code(), Some(23));
+        for handle in handles {
+            assert_eq!(
+                unsafe { WaitForSingleObject(handle.as_raw_handle(), 5000) },
+                WAIT_OBJECT_0
+            );
+        }
     }
 }

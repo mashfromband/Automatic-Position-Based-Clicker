@@ -33,7 +33,7 @@ fn checked(result: i32) -> io::Result<()> {
 }
 
 /// Runs in a disposable worker. Its parent also enforces an overall wall-clock limit.
-fn get(url: &str, limit: usize) -> io::Result<Vec<u8>> {
+fn get(url: &str, limit: usize, budget: Duration) -> io::Result<Vec<u8>> {
     let rest = url
         .strip_prefix("https://")
         .ok_or_else(|| invalid("HTTPS is required"))?;
@@ -77,8 +77,11 @@ fn get(url: &str, limit: usize) -> io::Result<Vec<u8>> {
             (&disabled as *const u32).cast(),
             size_of::<u32>() as u32,
         ))?;
-        let headers =
-            wide("Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2026-03-10\r\n");
+        let headers = wide(if host == "api.github.com" {
+            "Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2026-03-10\r\n"
+        } else {
+            "Accept: application/octet-stream\r\n"
+        });
         checked(WinHttpSendRequest(
             request.0,
             headers.as_ptr(),
@@ -104,7 +107,7 @@ fn get(url: &str, limit: usize) -> io::Result<Vec<u8>> {
                 "Release server returned HTTP {status}"
             )));
         }
-        let deadline = Instant::now() + Duration::from_secs(7);
+        let deadline = Instant::now() + budget;
         let mut body = Vec::new();
         loop {
             if Instant::now() >= deadline {
@@ -138,6 +141,7 @@ pub(super) fn check(root: &Path, report: &Path) -> io::Result<()> {
     let bytes = get(
         &format!("https://api.github.com/repos/{REPOSITORY}/releases/latest"),
         1024 * 1024,
+        Duration::from_secs(3),
     )?;
     let release: Release = serde_json::from_slice(&bytes).map_err(|e| invalid(&e.to_string()))?;
     let (binary, asset) = release.candidate()?;
@@ -147,7 +151,12 @@ pub(super) fn check(root: &Path, report: &Path) -> io::Result<()> {
         return atomic_json(report, &Option::<Binary>::None);
     }
     if binary.verify(root).is_err() {
-        let bytes = get(&asset.browser_download_url, MAX_BINARY)?;
+        atomic_json(&report.with_extension("download.json"), &true)?;
+        let bytes = get(
+            &asset.browser_download_url,
+            MAX_BINARY,
+            Duration::from_secs(15),
+        )?;
         if bytes.len() != asset.size {
             return Err(invalid("Incomplete release download"));
         }

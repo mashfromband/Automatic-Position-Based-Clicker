@@ -36,6 +36,9 @@ jobs:
     needs: windows
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: windows-latest
+    concurrency:
+      group: stable-release
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -78,5 +81,15 @@ jobs:
             gh release create $tag release-files/multi-point-clicker-windows-x86_64.exe release-files/multi-point-clicker-windows-x86_64.zip --target $env:RELEASE_COMMIT --title "Multi Point Clicker $version" --notes 'Windows版です。初回はZIPを展開し、Multi Point Clicker.exeから起動してください。以後は起動時に最新版を確認します。' --draft
           }
           if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the release' }
-          gh release edit $tag --draft=false --latest
+          $publishedTags = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect published versions' }
+          $maximum = [version]'0.0.0'
+          foreach ($publishedTag in $publishedTags) {
+            if ($publishedTag -match '^v([0-9]+\.[0-9]+\.[0-9]+)$') {
+              $publishedVersion = [version]$Matches[1]
+              if ($publishedVersion -gt $maximum) { $maximum = $publishedVersion }
+            }
+          }
+          $makeLatest = ([version]$version -gt $maximum).ToString().ToLowerInvariant()
+          gh release edit $tag --draft=false "--latest=$makeLatest"
           if ($LASTEXITCODE -ne 0) { throw 'Could not publish the release' }

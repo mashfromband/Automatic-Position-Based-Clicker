@@ -1,8 +1,9 @@
+use super::process::{self, ObservedProcess, Session};
 use super::*;
 use crate::startup::{READY_PATH, READY_TOKEN, Ready};
 use std::{
     os::windows::{fs::OpenOptionsExt, process::CommandExt},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     ptr::null,
     thread,
     time::{Duration, Instant},
@@ -57,45 +58,58 @@ pub fn existing_instance() -> bool {
 
 pub struct Runtime;
 impl AppRuntime for Runtime {
-    type Session = Child;
-    fn start(&mut self, pair: &Installation, root: &Path) -> io::Result<Child> {
+    type Session = Session;
+    fn start(&mut self, pair: &Installation, root: &Path) -> io::Result<Session> {
         let attempt = root.join("runs").join(unique_id());
         fs::create_dir_all(&attempt)?;
         let report = attempt.join("ready.json");
         let token = unique_id();
-        let mut cmd = command(&pair.binary.path(root));
-        cmd.current_dir(
-            pair.binary
-                .path(root)
+        let mut environment = vec![
+            (
+                "APPDATA".into(),
+                Some(pair.data_root(root).into_os_string()),
+            ),
+            (READY_PATH.into(), None),
+            (READY_TOKEN.into(), None),
+        ];
+        if pair.binary.protocol == 1 {
+            environment[1].1 = Some(report.clone().into_os_string());
+            environment[2].1 = Some(token.clone().into());
+        }
+        let executable = pair.binary.path(root);
+        let result = process::spawn(
+            &executable,
+            &[],
+            executable
                 .parent()
                 .ok_or_else(|| invalid("Missing executable directory"))?,
+            &environment,
         )
-        .env("APPDATA", pair.data_root(root))
-        .env_remove(READY_PATH)
-        .env_remove(READY_TOKEN);
-        if pair.binary.protocol == 1 {
-            cmd.env(READY_PATH, &report).env(READY_TOKEN, &token);
+        .and_then(|child| supervise(child, &report, &token, &pair.binary, Duration::from_secs(8)));
+        if match &result {
+            Ok(_) => true,
+            Err(e) => !is_cleanup_error(e),
+        } {
+            let _ = fs::remove_file(report);
+            let _ = fs::remove_dir(attempt);
         }
-        let child = cmd.spawn()?;
-        supervise(child, &report, &token, &pair.binary, Duration::from_secs(8))
+        result
     }
-    fn stop(&mut self, mut child: Child) -> io::Result<()> {
-        if child.try_wait()?.is_none() {
-            child.kill()?;
-        }
+    fn stop(&mut self, mut child: Session) -> io::Result<()> {
+        child.kill()?;
         child.wait()?;
         Ok(())
     }
 }
 
 /// Owns the child until ready; every error path terminates and reaps it.
-pub fn supervise(
-    mut child: Child,
+pub fn supervise<P: ObservedProcess>(
+    mut child: P,
     report: &Path,
     token: &str,
     binary: &Binary,
     timeout: Duration,
-) -> io::Result<Child> {
+) -> io::Result<P> {
     let result = (|| {
         if binary.protocol == 0 {
             return Ok(());
@@ -144,10 +158,8 @@ pub fn supervise(
     match result {
         Ok(()) => Ok(child),
         Err(error) => {
-            if child.try_wait()?.is_none() {
-                child.kill()?;
-            }
-            child.wait()?;
+            child.kill().map_err(cleanup_error)?;
+            child.wait().map_err(cleanup_error)?;
             Err(error)
         }
     }
@@ -219,8 +231,14 @@ fn check_update(root: &Path, state: &mut State) {
             .arg(root)
             .arg(&report)
             .spawn()?;
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut deadline = Instant::now() + Duration::from_secs(4);
+        let progress = report.with_extension("download.json");
+        let mut downloading = false;
         loop {
+            if !downloading && progress.is_file() {
+                deadline = Instant::now() + Duration::from_secs(15);
+                downloading = true;
+            }
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => break,
                 Ok(Some(_)) => return Err(io::Error::other("Could not check the latest release")),
@@ -254,6 +272,7 @@ fn check_update(root: &Path, state: &mut State) {
         log(root, "using_installed_version", &error.to_string());
     }
     let _ = fs::remove_file(report);
+    let _ = fs::remove_file(report_dir.join("result.download.json"));
     let _ = fs::remove_dir(report_dir);
 }
 
@@ -274,27 +293,52 @@ pub fn launch(root: &Path) -> io::Result<()> {
         Err(error) if error.raw_os_error() == Some(32) => return Ok(()),
         Err(error) => return Err(error),
     };
-    let mut state = if root.join("state.json").exists() || root.join("state-backup.json").exists() {
-        State::load(root)?
-    } else {
-        let legacy = std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .ok_or_else(|| invalid("APPDATA is unavailable"))?
-            .join("MultiPointClicker");
-        initialize(root, &legacy)?
+    let state_result =
+        if root.join("state.json").exists() || root.join("state-backup.json").exists() {
+            State::load(root)
+        } else {
+            let legacy = std::env::var_os("APPDATA")
+                .map(PathBuf::from)
+                .ok_or_else(|| invalid("APPDATA is unavailable"))?
+                .join("MultiPointClicker");
+            initialize(root, &legacy)
+        };
+    let mut state = match state_result {
+        Ok(state) => state,
+        Err(error) => return emergency_previous(root, error),
     };
     let recovered = recover(root, &mut state)?;
     if !recovered {
         check_update(root, &mut state);
     }
     let mut runtime = Runtime;
-    let mut child = match start(root, &mut state, &mut runtime) {
+    let child = match start(root, &mut state, &mut runtime) {
         Ok(child) => child,
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
         Err(error) => return Err(error),
     };
-    let status = child.wait()?;
-    if !status.success() && state.previous.is_some() {
+    clean_versions(root, &state);
+    finish(root, &mut state, child, &mut runtime)
+}
+
+pub fn finish<R: AppRuntime>(
+    root: &Path,
+    state: &mut State,
+    mut child: R::Session,
+    runtime: &mut R,
+) -> io::Result<()>
+where
+    R::Session: ObservedProcess,
+{
+    let status = child.wait();
+    runtime.stop(child).map_err(cleanup_error)?;
+    let status = status?;
+    if !status.success() {
+        if state.previous.is_none() || !startup_grace(state.confirmed_at, epoch_seconds()) {
+            return Err(io::Error::other(format!(
+                "Application exited abnormally ({status})"
+            )));
+        }
         log(
             root,
             "rolled_back",
@@ -307,9 +351,58 @@ pub fn launch(root: &Path) -> io::Result<()> {
             .ok_or_else(|| invalid("Previous application missing"))?;
         state.staged = None;
         state.pending = None;
+        state.confirmed_at = 0;
         state.save(root)?;
-        let mut restored = start(root, &mut state, &mut runtime)?;
-        restored.wait()?;
+        let mut restored = start(root, state, runtime)?;
+        let status = restored.wait();
+        runtime.stop(restored).map_err(cleanup_error)?;
+        let status = status?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "Previous application exited abnormally ({status})"
+            )));
+        }
+    }
+    if !state.current.settings_expected
+        && state
+            .current
+            .data_root(root)
+            .join("MultiPointClicker/settings.json")
+            .is_file()
+    {
+        state.current.settings_expected = true;
+        state.save(root)?;
+    }
+    Ok(())
+}
+
+fn emergency_previous(root: &Path, cause: io::Error) -> io::Result<()> {
+    log(root, "using_original_version", &cause.to_string());
+    let setup: Bootstrap = serde_json::from_slice(&fs::read(root.join("bootstrap.json"))?)
+        .map_err(|e| invalid(&e.to_string()))?;
+    let Some(binary) = setup.previous else {
+        return Err(cause);
+    };
+    if binary.protocol != 0 {
+        return Err(cause);
+    }
+    binary.verify(root)?;
+    let executable = binary.path(root);
+    let mut session = process::spawn(
+        &executable,
+        &[],
+        executable
+            .parent()
+            .ok_or_else(|| invalid("Missing previous application"))?,
+        &[(READY_PATH.into(), None), (READY_TOKEN.into(), None)],
+    )?;
+    let status = session.wait();
+    session.kill().map_err(cleanup_error)?;
+    let status = status?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "Original application exited abnormally ({status})"
+        )));
     }
     Ok(())
 }
