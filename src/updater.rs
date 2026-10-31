@@ -350,6 +350,26 @@ pub trait AppRuntime {
     /// A failure must leave no trial process running or writing application data.
     fn start(&mut self, pair: &Installation, root: &Path) -> io::Result<Self::Session>;
     fn stop(&mut self, session: Self::Session) -> io::Result<()>;
+
+    /// One shared post-ready transition for trials, ordinary starts and restored apps.
+    fn start_checked(
+        &mut self,
+        pair: &Installation,
+        root: &Path,
+    ) -> io::Result<(Installation, Self::Session)> {
+        let session = self.start(pair, root)?;
+        let mut verified = pair.clone();
+        verified.settings_expected |= pair.binary.protocol == 1
+            || pair
+                .data_root(root)
+                .join("MultiPointClicker/settings.json")
+                .is_file();
+        if let Err(error) = verified.verify(root) {
+            self.stop(session).map_err(cleanup_error)?;
+            return Err(error);
+        }
+        Ok((verified, session))
+    }
 }
 
 #[derive(Debug)]
@@ -392,7 +412,7 @@ pub fn start<R: AppRuntime>(
         let attempt = (|| {
             binary.verify(root)?;
             state.current.verify(root)?;
-            let mut trial = Installation {
+            let trial = Installation {
                 binary,
                 data: unique_id(),
                 settings_expected: state.current.settings_expected,
@@ -403,15 +423,7 @@ pub fn start<R: AppRuntime>(
             });
             state.save(root)?;
             attempted_startup = true;
-            let session = runtime.start(&trial, root)?;
-            trial.settings_expected |= trial
-                .data_root(root)
-                .join("MultiPointClicker/settings.json")
-                .is_file();
-            if let Err(error) = trial.verify(root) {
-                runtime.stop(session).map_err(cleanup_error)?;
-                return Err(error);
-            }
+            let (trial, session) = runtime.start_checked(&trial, root)?;
             let mut committed = state.clone();
             committed.previous = Some(state.current.clone());
             committed.current = trial;
@@ -461,9 +473,20 @@ pub fn start<R: AppRuntime>(
     let current_result = state
         .current
         .verify(root)
-        .and_then(|_| runtime.start(&state.current, root));
+        .and_then(|_| runtime.start_checked(&state.current, root));
     match current_result {
-        Ok(session) => Ok(session),
+        Ok((verified, session)) => {
+            if verified != state.current {
+                let mut updated = state.clone();
+                updated.current = verified;
+                if let Err(error) = updated.save(root) {
+                    runtime.stop(session).map_err(cleanup_error)?;
+                    return Err(error);
+                }
+                *state = updated;
+            }
+            Ok(session)
+        }
         Err(error) if is_cleanup_error(&error) => Err(error),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(error),
         Err(error) => {
@@ -472,7 +495,7 @@ pub fn start<R: AppRuntime>(
             };
             log(root, "rolled_back", &error.to_string());
             previous.verify(root)?;
-            let session = runtime.start(&previous, root)?;
+            let (previous, session) = runtime.start_checked(&previous, root)?;
             let mut restored = state.clone();
             restored.rejected = Some(state.current.binary.sha256.clone());
             restored.current = previous;

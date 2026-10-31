@@ -222,6 +222,23 @@ fn missing_settings_file_or_inner_directory_restores_the_old_data_pair() {
 }
 
 #[test]
+fn previously_saved_settings_are_not_silently_reset_when_no_backup_pair_exists() {
+    let temp = Temp::new();
+    let current = installed(&temp.0, "2.2.0", "last working data");
+    fs::remove_file(
+        current
+            .data_root(&temp.0)
+            .join("MultiPointClicker/settings.json"),
+    )
+    .unwrap();
+    let mut state = state(current, None);
+    state.save(&temp.0).unwrap();
+    let mut runtime = FakeRuntime::default();
+    assert!(start(&temp.0, &mut state, &mut runtime).is_err());
+    assert!(runtime.starts.is_empty());
+}
+
+#[test]
 fn transient_startup_timeout_is_retried_once_then_rejected() {
     struct TimeoutRuntime;
     impl AppRuntime for TimeoutRuntime {
@@ -498,6 +515,14 @@ mod processes {
             fs::write(path, b"new incompatible data").unwrap();
             std::process::exit(17);
         }
+        if behavior == "create-ready" {
+            fs::write(
+                PathBuf::from(std::env::var_os("APPDATA").unwrap())
+                    .join("MultiPointClicker/settings.json"),
+                b"fresh saved settings",
+            )
+            .unwrap();
+        }
         if behavior != "hang" {
             let ready = Ready {
                 token: if behavior == "bad-token" {
@@ -618,6 +643,32 @@ mod processes {
             assert!(runtime::finish(&temp.0, &mut state, child, &mut runtime).is_err());
             assert_eq!(runtime.starts.len(), usize::from(has_previous));
         }
+    }
+
+    #[test]
+    fn first_created_settings_are_recorded_before_a_crash_and_later_deletion() {
+        let temp = Temp::new();
+        let mut current = installed(&temp.0, "2.2.0", "temporary");
+        let settings = current
+            .data_root(&temp.0)
+            .join("MultiPointClicker/settings.json");
+        fs::remove_file(&settings).unwrap();
+        current.settings_expected = false;
+        let mut state = state(current, None);
+        state.save(&temp.0).unwrap();
+        let mut runtime = Processes {
+            starts: vec![],
+            bad_version: Version(99, 0, 0),
+            old_behavior: "create-ready",
+        };
+        let mut child = start(&temp.0, &mut state, &mut runtime).unwrap();
+        assert!(State::load(&temp.0).unwrap().current.settings_expected);
+        child.kill().unwrap();
+        assert!(runtime::finish(&temp.0, &mut state, child, &mut runtime).is_err());
+        fs::remove_file(settings).unwrap();
+        let mut reloaded = State::load(&temp.0).unwrap();
+        assert!(start(&temp.0, &mut reloaded, &mut runtime).is_err());
+        assert_eq!(runtime.starts.len(), 1);
     }
 
     #[test]
