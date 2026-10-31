@@ -634,7 +634,125 @@ pub(crate) fn pointer_inputs(right: bool) -> [INPUT; 2] {
 }
 
 pub const KEY_CLICK_TAG: usize = 0x4d50434b;
-pub(crate) fn click_once_restore(x: i32, y: i32, right: bool) -> Result<(), ClickerError> {
+const GAME_PRESS_TIME: Duration = Duration::from_millis(50);
+const GAME_RELEASE_TIME: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClickPhase {
+    Press,
+    Release,
+    Restore,
+}
+
+trait GameClickIo {
+    fn allowed(&mut self) -> bool;
+    fn send(&mut self, phase: ClickPhase) -> Result<(), ClickerError>;
+    fn wait(&mut self, duration: Duration) -> Result<bool, ClickerError>;
+}
+struct ClickCleanup<'a, T: GameClickIo> {
+    io: &'a mut T,
+    released: bool,
+    restored: bool,
+}
+impl<T: GameClickIo> ClickCleanup<'_, T> {
+    fn finish(&mut self) -> Result<(), ClickerError> {
+        let release = if self.released {
+            Ok(())
+        } else {
+            self.io.send(ClickPhase::Release)
+        };
+        self.released = release.is_ok();
+        let restore = self.io.send(ClickPhase::Restore);
+        self.restored = restore.is_ok();
+        release.and(restore)
+    }
+}
+impl<T: GameClickIo> Drop for ClickCleanup<'_, T> {
+    fn drop(&mut self) {
+        // Includes partial DOWN insertion and unwinding: never intentionally leave
+        // a synthesized button held or the pointer at the virtual controller.
+        if !self.released {
+            let _ = self.io.send(ClickPhase::Release);
+            self.restored = false;
+        }
+        if !self.restored {
+            let _ = self.io.send(ClickPhase::Restore);
+        }
+    }
+}
+fn game_click(io: &mut impl GameClickIo) -> Result<bool, ClickerError> {
+    if !io.allowed() {
+        return Ok(false);
+    }
+    let mut cleanup = ClickCleanup {
+        io,
+        released: false,
+        restored: false,
+    };
+    let result = (|| {
+        cleanup.io.send(ClickPhase::Press)?;
+        if !cleanup.io.wait(GAME_PRESS_TIME)? {
+            return Ok(false);
+        }
+        cleanup.io.send(ClickPhase::Release)?;
+        cleanup.released = true;
+        if !cleanup.io.wait(GAME_RELEASE_TIME)? {
+            return Ok(false);
+        }
+        Ok(true)
+    })();
+    let finished = cleanup.finish();
+    match result {
+        Err(error) => Err(error),
+        Ok(clicked) => finished.map(|_| clicked),
+    }
+}
+
+struct NativeGameClick<F> {
+    events: [INPUT; 3],
+    allowed: F,
+}
+impl<F: Fn() -> bool> GameClickIo for NativeGameClick<F> {
+    fn allowed(&mut self) -> bool {
+        (self.allowed)()
+    }
+    fn send(&mut self, phase: ClickPhase) -> Result<(), ClickerError> {
+        let mut event = match phase {
+            ClickPhase::Press => self.events[0],
+            ClickPhase::Release => self.events[1],
+            ClickPhase::Restore => self.events[2],
+        };
+        if phase == ClickPhase::Release && !(self.allowed)() {
+            unsafe {
+                event.Anonymous.mi.dwFlags &=
+                    !(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK);
+            }
+        }
+        if unsafe { SendInput(1, &event, size_of::<INPUT>() as i32) } != 1 {
+            return Err(os_error(ErrorCode::InputSend));
+        }
+        Ok(())
+    }
+    fn wait(&mut self, duration: Duration) -> Result<bool, ClickerError> {
+        let deadline = Instant::now() + duration;
+        loop {
+            if !(self.allowed)() {
+                return Ok(false);
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Ok(true);
+            };
+            thread::sleep(remaining.min(Duration::from_millis(2)));
+        }
+    }
+}
+
+pub(crate) fn click_once_restore(
+    x: i32,
+    y: i32,
+    right: bool,
+    allowed: impl Fn() -> bool,
+) -> Result<bool, ClickerError> {
     let desktop = Desktop::current()?;
     let target = Point {
         x,
@@ -655,26 +773,10 @@ pub(crate) fn click_once_restore(x: i32, y: i32, right: bool) -> Result<(), Clic
     if Desktop::current()? != desktop {
         return Err(ErrorCode::ScreenChanged.into());
     }
-    if unsafe {
-        SendInput(
-            inputs.len() as u32,
-            inputs.as_ptr(),
-            size_of::<INPUT>() as i32,
-        )
-    } != inputs.len() as u32
-    {
-        let err = os_error(ErrorCode::InputSend);
-        let recover = [inputs[1], inputs[2]];
-        unsafe {
-            SendInput(
-                recover.len() as u32,
-                recover.as_ptr(),
-                size_of::<INPUT>() as i32,
-            );
-        }
-        return Err(err);
-    }
-    Ok(())
+    game_click(&mut NativeGameClick {
+        events: inputs,
+        allowed,
+    })
 }
 
 fn click_restore_inputs(
@@ -707,11 +809,12 @@ fn click_restore_inputs(
         make(
             target.x,
             target.y,
-            if right {
-                MOUSEEVENTF_RIGHTUP
-            } else {
-                MOUSEEVENTF_LEFTUP
-            },
+            absolute
+                | if right {
+                    MOUSEEVENTF_RIGHTUP
+                } else {
+                    MOUSEEVENTF_LEFTUP
+                },
         ),
         make(restore.x, restore.y, absolute),
     ]
@@ -767,8 +870,250 @@ pub fn benchmark(interval_ticks: u64, count: usize) -> Result<BenchmarkReport, C
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct FrameGame {
+        now: u64,
+        next: u64,
+        period: u64,
+        position: (i32, i32),
+        down: bool,
+        previous_down: bool,
+        target: (i32, i32),
+        presses: usize,
+        releases: usize,
+    }
+    impl FrameGame {
+        fn new(period: u64, phase: u64, target: (i32, i32)) -> Self {
+            Self {
+                now: 0,
+                next: phase,
+                period,
+                position: (0, 0),
+                down: false,
+                previous_down: false,
+                target,
+                presses: 0,
+                releases: 0,
+            }
+        }
+        fn input(&mut self, inputs: &[INPUT]) {
+            for input in inputs {
+                let event = unsafe { input.Anonymous.mi };
+                if event.dwFlags & MOUSEEVENTF_MOVE != 0 {
+                    self.position = (event.dx, event.dy);
+                }
+                if event.dwFlags & (MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_RIGHTDOWN) != 0 {
+                    self.down = true;
+                }
+                if event.dwFlags & (MOUSEEVENTF_LEFTUP | MOUSEEVENTF_RIGHTUP) != 0 {
+                    self.down = false;
+                }
+            }
+        }
+        fn advance(&mut self, nanoseconds: u64) {
+            let until = self.now + nanoseconds;
+            while self.next < until {
+                if self.position == self.target {
+                    if self.down && !self.previous_down {
+                        self.presses += 1;
+                    }
+                    if !self.down && self.previous_down {
+                        self.releases += 1;
+                    }
+                }
+                self.previous_down = self.down;
+                self.next += self.period;
+            }
+            self.now = until;
+        }
+    }
+    struct SampledClick {
+        game: FrameGame,
+        events: [INPUT; 3],
+        phases: Vec<ClickPhase>,
+        allowed: bool,
+        cancel_wait: Option<usize>,
+        fail_send: Option<usize>,
+        fail_releases: u8,
+        waits: usize,
+    }
+    impl GameClickIo for SampledClick {
+        fn allowed(&mut self) -> bool {
+            self.allowed
+        }
+        fn send(&mut self, phase: ClickPhase) -> Result<(), ClickerError> {
+            self.phases.push(phase);
+            if phase == ClickPhase::Release && self.fail_releases > 0 {
+                self.fail_releases -= 1;
+                return Err(ErrorCode::InputSend.into());
+            }
+            let event = match phase {
+                ClickPhase::Press => self.events[0],
+                ClickPhase::Release => self.events[1],
+                ClickPhase::Restore => self.events[2],
+            };
+            self.game.input(&[event]);
+            if self.fail_send == Some(self.phases.len()) {
+                return Err(ErrorCode::InputSend.into());
+            }
+            Ok(())
+        }
+        fn wait(&mut self, duration: Duration) -> Result<bool, ClickerError> {
+            self.waits += 1;
+            self.game.advance(duration.as_nanos() as u64);
+            if self.cancel_wait == Some(self.waits) {
+                self.allowed = false;
+                return Ok(false);
+            }
+            Ok(true)
+        }
+    }
+    fn sampled_click(period: u64, phase: u64, right: bool) -> SampledClick {
+        let desktop = Desktop {
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let target = Point {
+            x: 180,
+            y: 730,
+            interval_ticks: None,
+        };
+        SampledClick {
+            game: FrameGame::new(
+                period,
+                phase,
+                (normalize(target.x, 0, 1920), normalize(target.y, 0, 1080)),
+            ),
+            events: click_restore_inputs(&desktop, &target, POINT { x: 900, y: 400 }, right),
+            phases: vec![],
+            allowed: true,
+            cancel_wait: None,
+            fail_send: None,
+            fail_releases: 0,
+            waits: 0,
+        }
+    }
     #[test]
-    fn one_shot_is_exactly_one_click_then_cursor_restore_in_one_batch() {
+    fn frame_polling_game_observes_a_press_and_release_at_the_registered_position() {
+        for hz in [20, 30, 60, 120, 240] {
+            let period = 1_000_000_000 / hz;
+            for phase in [0, period / 4, period / 2, period - 1] {
+                for right in [false, true] {
+                    let mut io = sampled_click(period, phase, right);
+                    assert!(game_click(&mut io).unwrap());
+                    io.game.advance(200_000_000);
+                    assert_eq!(
+                        (io.game.presses, io.game.releases),
+                        (1, 1),
+                        "{hz} Hz, phase {phase}"
+                    );
+                    assert_eq!(
+                        io.phases,
+                        [ClickPhase::Press, ClickPhase::Release, ClickPhase::Restore]
+                    );
+                    assert_eq!(
+                        io.game.position,
+                        (normalize(900, 0, 1920), normalize(400, 0, 1080))
+                    );
+                    assert!(!io.game.down);
+                }
+            }
+        }
+    }
+    #[test]
+    fn repeated_game_clicks_leave_a_visible_release_before_the_next_press() {
+        for hz in [20, 30, 60, 120, 240] {
+            let period = 1_000_000_000 / hz;
+            for phase in [0, period / 4, period / 2, period - 1] {
+                let mut io = sampled_click(period, phase, false);
+                for _ in 0..12 {
+                    assert!(game_click(&mut io).unwrap());
+                }
+                io.game.advance(200_000_000);
+                assert_eq!((io.game.presses, io.game.releases), (12, 12));
+            }
+        }
+    }
+    #[test]
+    fn failed_or_cancelled_game_click_always_releases_and_restores_without_repressing() {
+        for cancel in [Some(1), Some(2)] {
+            let mut io = sampled_click(16_666_666, 1, false);
+            io.cancel_wait = cancel;
+            assert!(!game_click(&mut io).unwrap());
+            assert!(!io.game.down);
+            assert_eq!(
+                io.phases
+                    .iter()
+                    .filter(|p| **p == ClickPhase::Press)
+                    .count(),
+                1
+            );
+            assert_eq!(io.phases.last(), Some(&ClickPhase::Restore));
+        }
+        for fail in 1..=3 {
+            let mut io = sampled_click(16_666_666, 1, false);
+            io.fail_send = Some(fail);
+            assert!(game_click(&mut io).is_err());
+            assert!(!io.game.down);
+            assert_eq!(
+                io.phases
+                    .iter()
+                    .filter(|p| **p == ClickPhase::Press)
+                    .count(),
+                1
+            );
+            assert_eq!(io.phases.last(), Some(&ClickPhase::Restore));
+        }
+        let mut io = sampled_click(16_666_666, 1, false);
+        io.allowed = false;
+        assert!(!game_click(&mut io).unwrap());
+        assert!(io.phases.is_empty());
+    }
+    #[test]
+    fn panicking_game_click_releases_and_restores_during_unwinding() {
+        struct PanicWait(SampledClick);
+        impl GameClickIo for PanicWait {
+            fn allowed(&mut self) -> bool {
+                self.0.allowed()
+            }
+            fn send(&mut self, phase: ClickPhase) -> Result<(), ClickerError> {
+                self.0.send(phase)
+            }
+            fn wait(&mut self, _: Duration) -> Result<bool, ClickerError> {
+                panic!("fixture wait panic")
+            }
+        }
+        let mut io = PanicWait(sampled_click(16_666_666, 1, false));
+        let result = catch_unwind(AssertUnwindSafe(|| game_click(&mut io)));
+        assert!(result.is_err());
+        assert!(!io.0.game.down);
+        assert_eq!(
+            io.0.phases,
+            [ClickPhase::Press, ClickPhase::Release, ClickPhase::Restore]
+        );
+    }
+    #[test]
+    fn release_retry_also_restores_the_cursor_after_the_retry() {
+        let mut io = sampled_click(16_666_666, 1, false);
+        io.fail_releases = 2;
+        assert!(game_click(&mut io).is_err());
+        assert!(!io.game.down);
+        assert_eq!(
+            io.game.position,
+            (normalize(900, 0, 1920), normalize(400, 0, 1080))
+        );
+        assert_eq!(io.phases.last(), Some(&ClickPhase::Restore));
+        assert_eq!(
+            io.phases
+                .iter()
+                .filter(|p| **p == ClickPhase::Press)
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn one_shot_events_press_and_release_at_target_then_restore_without_extra_clicks() {
         let desktop = Desktop {
             left: -1920,
             top: 0,
@@ -808,6 +1153,8 @@ mod tests {
                 (events[0].dx, events[0].dy),
                 (normalize(-900, -1920, 3840), normalize(700, 0, 1080))
             );
+            assert_eq!((events[1].dx, events[1].dy), (events[0].dx, events[0].dy));
+            assert_ne!(events[1].dwFlags & MOUSEEVENTF_MOVE, 0);
             assert_eq!(
                 (events[2].dx, events[2].dy),
                 (normalize(900, -1920, 3840), normalize(300, 0, 1080))

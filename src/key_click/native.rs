@@ -10,6 +10,7 @@ use std::{
         mpsc::{self, SyncSender},
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::*,
@@ -219,6 +220,7 @@ struct Request {
     snapshot: Arc<Snapshot>,
     generation: u64,
     index: usize,
+    created: Instant,
 }
 struct Shared {
     snapshot: RwLock<Arc<Snapshot>>,
@@ -231,7 +233,7 @@ struct Shared {
     output: Mutex<()>,
 }
 impl Shared {
-    fn current(&self, request: &Request) -> bool {
+    fn valid(&self, request: &Request) -> bool {
         self.active.load(Ordering::Acquire)
             && self.desired.load(Ordering::Acquire)
             && !self.stopping.load(Ordering::Acquire)
@@ -240,6 +242,9 @@ impl Shared {
                 .snapshot
                 .read()
                 .is_ok_and(|snapshot| Arc::ptr_eq(&snapshot, &request.snapshot))
+    }
+    fn current(&self, request: &Request) -> bool {
+        self.valid(request) && request.created.elapsed() <= Duration::from_millis(250)
     }
     fn report(&self, error: ClickerError) {
         if let Ok(mut slot) = self.error.lock() {
@@ -334,6 +339,7 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
                         snapshot,
                         generation,
                         index,
+                        created: Instant::now(),
                     };
                     if context.sender.try_send(request).is_err() {
                         shared.report(ErrorCode::InputSend.into());
@@ -368,7 +374,7 @@ impl Controller {
             error: Mutex::new(None),
             output: Mutex::new(()),
         });
-        let (sender, receiver) = mpsc::sync_channel::<Request>(64);
+        let (sender, receiver) = mpsc::sync_channel::<Request>(8);
         let worker_shared = shared.clone();
         let worker = thread::Builder::new()
             .name("key-click-input".into())
@@ -399,8 +405,14 @@ impl Controller {
                             {
                                 return Ok(false);
                             }
-                            crate::engine::click_once_restore(x, y, right)?;
-                            Ok(true)
+                            crate::engine::click_once_restore(x, y, right, || {
+                                worker_shared.valid(&request)
+                                    && request
+                                        .snapshot
+                                        .target
+                                        .as_ref()
+                                        .is_some_and(|target| target.foreground())
+                            })
                         },
                     );
                     if let Err(error) = result {
@@ -603,6 +615,7 @@ mod tests {
             snapshot: snapshot.clone(),
             generation: 1,
             index: 0,
+            created: Instant::now(),
         };
         let emitted = Mutex::new(Vec::new());
         let send = |x, y, right| {
@@ -638,6 +651,7 @@ mod tests {
             snapshot,
             generation: shared.generation.load(Ordering::Acquire),
             index: 0,
+            created: Instant::now(),
         };
         assert!(
             !dispatch(
@@ -652,7 +666,25 @@ mod tests {
             snapshot: shared.snapshot.read().unwrap().clone(),
             generation: shared.generation.load(Ordering::Acquire),
             index: 0,
+            created: Instant::now(),
         };
+        let expired = Request {
+            snapshot: current.snapshot.clone(),
+            generation: current.generation,
+            index: 0,
+            created: Instant::now() - Duration::from_secs(1),
+        };
+        assert!(
+            !dispatch(
+                &shared,
+                &expired,
+                || panic!("expired request reached resolver"),
+                send
+            )
+            .unwrap()
+        );
+        // Once a pulse starts, aging alone must not cut its 50ms hold short.
+        assert!(shared.valid(&expired));
         assert!(dispatch(&shared, &current, || Ok(Some((340, 450, true))), send).unwrap());
         assert_eq!(
             *emitted.lock().unwrap(),
