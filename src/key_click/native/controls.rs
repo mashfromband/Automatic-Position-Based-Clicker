@@ -28,6 +28,7 @@ pub(super) struct ActiveSettings {
     pub movement_mode: MovementMode,
     pub input_method: InputMethod,
     pub stick: StickSettings,
+    pub operation_hotkeys: Vec<(u32, u32)>,
 }
 impl From<&KeyClickSettings> for ActiveSettings {
     fn from(settings: &KeyClickSettings) -> Self {
@@ -45,6 +46,7 @@ impl From<&KeyClickSettings> for ActiveSettings {
             movement_mode: settings.movement_mode,
             input_method: settings.input_method,
             stick: settings.stick.clone(),
+            operation_hotkeys: Vec::new(),
         }
     }
 }
@@ -137,6 +139,23 @@ impl SourceKeyState {
         if !context.ready {
             self.suspend();
         }
+        let modifiers =
+            u32::from(
+                context.alt || self.physical[0x12] || self.physical[0xa4] || self.physical[0xa5],
+            ) | (u32::from(self.physical[0x11] || self.physical[0xa2] || self.physical[0xa3]) << 1)
+                | (u32::from(self.shift_down()) << 2)
+                | (u32::from(self.physical[0x5b] || self.physical[0x5c]) << 3);
+        let reserved = down
+            && settings
+                .operation_hotkeys
+                .iter()
+                .any(|(mods, registered)| *registered == key && *mods & 0x0f == modifiers);
+        if reserved {
+            self.suspend();
+            // A matching repeat must reach RegisterHotKey even if this physical
+            // key originally started an unmodified game control.
+            self.consumed[key as usize] = false;
+        }
         // Legacy all-Click Mouse mappings keep their original shortcut priority.
         // Shift remains ordinary OS input in both the legacy and modern routes.
         let legacy_shift = !settings.has_modern_controls() && self.shift_down();
@@ -145,7 +164,7 @@ impl SourceKeyState {
             down,
             false,
             context.ready && settings.handles(key),
-            !context.ready || context.alt || legacy_shift,
+            !context.ready || context.alt || legacy_shift || reserved,
             now,
         )
     }

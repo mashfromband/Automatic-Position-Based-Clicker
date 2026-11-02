@@ -818,6 +818,120 @@ fn mouse_motion_disarms_the_current_control_instead_of_fighting_the_user() {
 }
 
 #[test]
+fn one_pixel_quantization_is_not_a_physical_takeover_and_restores_after_release() {
+    let mut h = Harness::new(
+        InputMethod::Mouse,
+        MovementMode::Buttons,
+        PressBehavior::Hold,
+    );
+    h.key(b'W' as u32, true, 0);
+    h.frame(0).unwrap();
+    h.runtime.sink.state.position.x += 1;
+    h.runtime.sink.state.position.y -= 1;
+    h.frame(8).unwrap();
+    assert_eq!(h.runtime.sink.downs(), 1);
+    assert_eq!(h.runtime.sink.ups(), 0);
+    assert!(h.runtime.warning.is_none());
+    h.key(b'W' as u32, false, 9);
+    h.frame(9).unwrap();
+    assert_eq!(h.runtime.sink.ups(), 1);
+    assert_eq!(h.runtime.sink.state.position, Pixel { x: -100, y: 40 });
+}
+
+#[test]
+fn ordinary_mouse_clicks_wait_in_order_but_expired_and_cancelled_taps_do_not_replay() {
+    let mut h = Harness::new(
+        InputMethod::Mouse,
+        MovementMode::Buttons,
+        PressBehavior::Click,
+    );
+    h.key(b'W' as u32, true, 0);
+    h.key(0x20, true, 0);
+    for at in [0, 8, 50, 99] {
+        h.frame(at).unwrap();
+    }
+    assert_eq!(h.runtime.sink.downs(), 1);
+    h.frame(100).unwrap();
+    assert_eq!(h.runtime.sink.downs(), 2);
+    assert!(h.runtime.warning.is_none());
+    h.frame(150).unwrap();
+    h.frame(200).unwrap();
+    assert_eq!(h.runtime.completed, 2);
+    let pressed: Vec<_> = h
+        .runtime
+        .sink
+        .mouse_packets()
+        .windows(2)
+        .filter(|pair| pair[1].flags & MOUSEEVENTF_LEFTDOWN != 0)
+        .map(|pair| pair[0].point.unwrap())
+        .collect();
+    assert_eq!(
+        pressed,
+        [Pixel { x: 100, y: 150 }, Pixel { x: 220, y: 150 }]
+    );
+
+    let mut stopped = Harness::new(
+        InputMethod::Mouse,
+        MovementMode::Buttons,
+        PressBehavior::Click,
+    );
+    stopped.key(b'W' as u32, true, 0);
+    stopped.key(0x20, true, 0);
+    stopped.frame(0).unwrap();
+    stopped.stop().unwrap();
+    stopped.frame(500).unwrap();
+    assert_eq!(stopped.runtime.sink.downs(), 1);
+
+    let mut expired = Harness::new(
+        InputMethod::Mouse,
+        MovementMode::Buttons,
+        PressBehavior::Click,
+    );
+    expired.key(b'W' as u32, true, 0);
+    expired.key(0x20, true, 0);
+    expired.frame(0).unwrap();
+    expired.frame(300).unwrap();
+    expired.frame(350).unwrap();
+    assert_eq!(expired.runtime.sink.downs(), 1);
+}
+
+#[test]
+fn registered_shift_hotkeys_take_priority_without_disabling_other_shift_movement() {
+    for method in [InputMethod::Mouse, InputMethod::Touch] {
+        for mode in [MovementMode::Buttons, MovementMode::Stick] {
+            let mut h = Harness::new(method, mode, PressBehavior::Hold);
+            h.settings
+                .bindings
+                .retain(|binding| binding.key != Some(SHIFT));
+            h.settings.operation_hotkeys = vec![(MOD_SHIFT, b'W' as u32), (MOD_SHIFT, 0x20)];
+            assert!(!h.key(0xa0, true, 0));
+            h.frame(0).unwrap();
+            let before = h.runtime.sink.downs();
+            assert!(!h.key(b'W' as u32, true, 1));
+            assert!(!h.key(b'W' as u32, true, 2));
+            h.frame(2).unwrap();
+            assert_eq!(h.runtime.sink.downs(), before);
+            assert!(!h.key(b'W' as u32, false, 3));
+            assert!(!h.key(0x20, true, 4));
+            assert!(!h.key(0x20, false, 5));
+            h.frame(5).unwrap();
+            assert_eq!(h.runtime.sink.downs(), before);
+            assert!(h.key(b'D' as u32, true, 6));
+            h.frame(6).unwrap();
+            assert_eq!(h.runtime.sink.downs(), before + 1);
+            h.key(b'D' as u32, false, 7);
+            h.frame(7).unwrap();
+            h.frame(8).unwrap();
+            h.settings.operation_hotkeys.clear();
+            assert!(h.key(b'W' as u32, true, 9));
+            h.frame(9).unwrap();
+            assert_eq!(h.runtime.sink.downs(), before + 2);
+            h.stop().unwrap();
+        }
+    }
+}
+
+#[test]
 fn no_owned_input_means_stop_sends_no_mouse_or_touch_up() {
     for method in [InputMethod::Mouse, InputMethod::Touch] {
         let mut h = Harness::new(method, MovementMode::Buttons, PressBehavior::Hold);
@@ -842,7 +956,7 @@ fn touch_right_action_warns_without_releasing_movement_or_changing_saved_mouse_d
     assert_eq!(h.runtime.sink.ups(), 0);
     assert_eq!(
         h.runtime.warning.as_ref().unwrap().code,
-        ErrorCode::InputCombination
+        ErrorCode::InputRightButton
     );
     assert_eq!(h.settings, saved);
 }
@@ -878,7 +992,11 @@ fn rejected_additional_actions_are_never_resolved_or_allowed_to_interrupt_moveme
         assert_eq!(h.runtime.sink.ups(), 0);
         assert_eq!(
             h.runtime.warning.as_ref().unwrap().code,
-            ErrorCode::InputCombination
+            if method == InputMethod::Touch {
+                ErrorCode::InputRightButton
+            } else {
+                ErrorCode::InputCombination
+            }
         );
         h.stop().unwrap();
     }
@@ -1308,6 +1426,81 @@ fn focus_loss_during_resolution_disarms_the_live_source_before_focus_returns() {
 struct GateSink {
     fake: FakeSink,
     gate: Arc<(Mutex<(bool, bool)>, Condvar)>,
+}
+
+#[test]
+fn transient_target_rejection_releases_then_requires_a_fresh_press_without_a_toggle() {
+    for code in [
+        ErrorCode::KeyTarget,
+        ErrorCode::PointOutside,
+        ErrorCode::ScreenChanged,
+    ] {
+        let shared = Shared::new(
+            FakeSink::default(),
+            Arc::new(Mutex::new(PhysicalMouse::default())),
+        );
+        let active = ActiveSettings::from(&settings(
+            InputMethod::Touch,
+            MovementMode::Buttons,
+            PressBehavior::Hold,
+        ));
+        let snapshot = Arc::new(Snapshot {
+            source: active.clone(),
+            settings: active,
+            target: None,
+            size: Some((1000, 800)),
+        });
+        *shared.snapshot.write().unwrap() = snapshot.clone();
+        shared.active.store(true, Ordering::Release);
+        shared.desired.store(true, Ordering::Release);
+        let now = Instant::now();
+        shared
+            .source
+            .lock()
+            .unwrap()
+            .event(b'W' as u32, true, false, true, false, now);
+        let resolve = |point: &ClientPoint| {
+            Ok(Pixel {
+                x: point.x,
+                y: point.y,
+            })
+        };
+        shared.process(&snapshot, now, || true, resolve);
+        assert_eq!(shared.output.lock().unwrap().sink.downs(), 1);
+        shared.process(
+            &snapshot,
+            now + Duration::from_millis(8),
+            || true,
+            |_| Err(code.clone().into()),
+        );
+        assert_eq!(shared.error.lock().unwrap().take().unwrap().code, code);
+        assert!(shared.active.load(Ordering::Acquire));
+        assert!(shared.output.lock().unwrap().sink.contacts.is_empty());
+        shared
+            .source
+            .lock()
+            .unwrap()
+            .event(b'W' as u32, true, false, true, false, now);
+        shared.process(
+            &snapshot,
+            now + Duration::from_millis(16),
+            || true,
+            |_| panic!("old physical hold was replayed"),
+        );
+        shared
+            .source
+            .lock()
+            .unwrap()
+            .event(b'W' as u32, false, false, true, false, now);
+        shared
+            .source
+            .lock()
+            .unwrap()
+            .event(b'W' as u32, true, false, true, false, now);
+        shared.process(&snapshot, now + Duration::from_millis(24), || true, resolve);
+        assert_eq!(shared.output.lock().unwrap().sink.downs(), 2);
+        shared.pause();
+    }
 }
 
 #[test]

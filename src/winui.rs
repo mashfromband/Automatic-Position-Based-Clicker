@@ -204,6 +204,18 @@ fn error_text(error: &ClickerError, japanese: bool) -> String {
             "マウスでは別々の位置を同時に保持できません。ゲームが対応していればタッチ入力を選んでください。",
             "A mouse cannot hold separate positions at once. Choose Touch if the game supports touch input.",
         ),
+        InputRightButton => (
+            "タッチ入力では右クリックできません。入力方式にマウスを選んでください。",
+            "Touch input cannot right-click. Choose Mouse as the input method.",
+        ),
+        InputMouseMoved => (
+            "手動のマウス操作を優先しました。割り当てたキーを離して、押し直してください。",
+            "Manual mouse movement took priority. Release the assigned key and press it again.",
+        ),
+        InputMouseBusy => (
+            "物理マウスのボタンが押されています。マウスのボタンと割り当てたキーを離してから、キーを押し直してください。",
+            "A physical mouse button is held. Release the mouse button and the assigned key, then press the key again.",
+        ),
         InputInitialize => (
             "選択した入力方式を準備できません。ゲームの対応や実行権限を確認してください。",
             "Cannot initialize the selected input method. Check game support and application permissions.",
@@ -897,8 +909,12 @@ impl App {
         }
         self.enable(KEY_PROFILE, !self.busy());
         self.enable(
+            KEY_PROFILE_NEW,
+            !self.busy() && self.settings.key_clicks.profiles.len() < key_click::MAX_PROFILES,
+        );
+        self.enable(
             KEY_PROFILE_DELETE,
-            !self.busy() && self.settings.key_clicks.selected_profile.is_some(),
+            !self.busy() && !self.settings.key_clicks.profiles.is_empty(),
         );
         let name = self
             .key_target
@@ -1211,6 +1227,9 @@ impl App {
         }
     }
     fn change_key_profile(&mut self, change: ProfileChange) {
+        self.change_key_profile_using(change, Self::stop_key_profile_runtime);
+    }
+    fn stop_key_profile_runtime(&mut self) {
         self.cancel_capture();
         if let Some(mut controller) = self.key_controller.take() {
             controller.stop();
@@ -1218,13 +1237,19 @@ impl App {
         // A saved identity never authorizes reuse of the previous live window.
         self.key_target = None;
         self.settings.key_clicks.enabled = false;
+    }
+    fn change_key_profile_using(
+        &mut self,
+        change: ProfileChange,
+        stop_current: impl FnOnce(&mut Self),
+    ) {
+        let keeps_current = matches!(change, ProfileChange::Delete(id)
+            if Some(id) != self.settings.key_clicks.selected_profile);
         if !self.commit() {
             self.restore_profile_selection();
-            unsafe {
-                SendMessageW(self.control(KEY_ENABLE), BM_SETCHECK, 0, 0);
-            }
             return;
         }
+        stop_current(self);
         let result = match change {
             ProfileChange::Select(id) => self.settings.key_clicks.select_profile(id),
             ProfileChange::New => self.settings.key_clicks.new_profile(),
@@ -1232,18 +1257,100 @@ impl App {
         };
         match result {
             Ok(()) => {
-                self.profile_draft_name = None;
-                self.message = self
-                    .t(
-                        "設定を切り替えました。ゲーム画面を選び直してください。",
-                        "Profile changed. Choose the game window again.",
-                    )
-                    .into();
+                if keeps_current {
+                    self.message = self
+                        .t(
+                            "保存済みの設定を削除しました。編集中の設定は保持しています。",
+                            "Saved profile deleted. Your current edits have been kept.",
+                        )
+                        .into();
+                } else {
+                    self.profile_draft_name = None;
+                    self.message = self
+                        .t(
+                            "設定を切り替えました。ゲーム画面を選び直してください。",
+                            "Profile changed. Choose the game window again.",
+                        )
+                        .into();
+                }
                 self.save();
             }
             Err(error) => self.message = error_text(&error, self.settings.lang == "ja"),
         }
         self.rebuild();
+    }
+    fn choose_key_profile_to_delete(&self) -> Option<u64> {
+        let candidates = profile_deletion_candidates(&self.settings.key_clicks);
+        if let Some(id) = self.settings.key_clicks.selected_profile {
+            return candidates
+                .iter()
+                .any(|(saved, _)| *saved == id)
+                .then_some(id);
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        unsafe {
+            let menu = CreatePopupMenu();
+            if menu.is_null() {
+                return None;
+            }
+            for (index, (_, name)) in candidates.iter().enumerate() {
+                if AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    index + 1,
+                    wide(&name.replace('&', "&&")).as_ptr(),
+                ) == 0
+                {
+                    DestroyMenu(menu);
+                    return None;
+                }
+            }
+            let mut anchor: RECT = zeroed();
+            if GetWindowRect(self.control(KEY_PROFILE_DELETE), &mut anchor) == 0 {
+                DestroyMenu(menu);
+                return None;
+            }
+            let command = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                anchor.left,
+                anchor.bottom,
+                0,
+                self.hwnd,
+                null(),
+            );
+            DestroyMenu(menu);
+            usize::try_from(command)
+                .ok()
+                .and_then(|id| id.checked_sub(1))
+                .and_then(|index| candidates.get(index))
+                .map(|(id, _)| *id)
+        }
+    }
+    fn delete_key_profile_with_confirmation(
+        &mut self,
+        id: u64,
+        confirm: impl FnOnce(&str) -> bool,
+    ) {
+        let Some((_, name)) = profile_deletion_candidates(&self.settings.key_clicks)
+            .into_iter()
+            .find(|(saved, _)| *saved == id)
+        else {
+            return;
+        };
+        let prompt = format!(
+            "{}\n{}",
+            self.t(
+                "このゲームの設定を削除しますか？",
+                "Delete this game profile?"
+            ),
+            name
+        );
+        if confirm(&prompt) {
+            self.change_key_profile(ProfileChange::Delete(id));
+        }
     }
     fn sync_key_runtime(&mut self, allow_start: bool) {
         let active = self.settings.key_clicks.enabled
@@ -1261,13 +1368,48 @@ impl App {
         {
             match KeyController::start() {
                 Ok(controller) => self.key_controller = Some(controller),
-                Err(error) => self.message = error_text(&error, self.settings.lang == "ja"),
+                Err(error) => self.handle_key_error(error),
             }
         }
+        let hotkeys =
+            reserved_key_hotkeys(&self.settings, self.hotkeys_ready, self.lock_hotkey_ready);
         if let Some(controller) = self.key_controller.as_mut() {
-            controller.configure(self.key_target.clone(), &self.settings.key_clicks);
+            controller.configure_with_hotkeys(
+                self.key_target.clone(),
+                &self.settings.key_clicks,
+                &hotkeys,
+            );
             controller.set_active(active);
         }
+    }
+    fn handle_key_error(&mut self, error: ClickerError) {
+        let detail = error_text(&error, self.settings.lang == "ja");
+        if fatal_key_error(&error.code) {
+            self.settings.key_clicks.enabled = false;
+            if let Some(mut controller) = self.key_controller.take() {
+                controller.set_active(false);
+                controller.stop();
+            }
+            unsafe {
+                SendMessageW(self.control(KEY_ENABLE), BM_SETCHECK, 0, 0);
+            }
+            let message = format!(
+                "{}\n{}",
+                self.t(
+                    "エラーのためキー操作を停止しました。",
+                    "Key controls stopped because of an error."
+                ),
+                detail
+            );
+            self.message = message.clone();
+            self.save();
+            if self.saved_error {
+                self.message = format!("{message}\n{}", self.message);
+            }
+        } else {
+            self.message = detail;
+        }
+        set_text(self.control(MESSAGE), &self.message);
     }
     fn key_conflict(&self, key: u32) -> bool {
         self.settings
@@ -2004,14 +2146,14 @@ impl App {
             let label = self.lock_caption(self.last.locked);
             set_text(self.control(LOCK), label);
         }
-        self.sync_key_runtime(false);
-        if let Some(controller) = &self.key_controller {
-            if let Some(error) = controller.take_error() {
-                if self.settings.key_clicks.enabled {
-                    self.message = error_text(&error, self.settings.lang == "ja");
-                }
-            }
+        if let Some(error) = self
+            .key_controller
+            .as_ref()
+            .and_then(|controller| controller.take_error())
+        {
+            self.handle_key_error(error);
         }
+        self.sync_key_runtime(false);
         if self.tab == 2 {
             let status = if !self.hotkeys_ready {
                 self.t(
@@ -2376,32 +2518,16 @@ impl App {
             return;
         }
         if id == KEY_PROFILE_DELETE {
-            let Some(selected) = self.settings.key_clicks.selected_profile else {
-                return;
-            };
-            let name = self
-                .settings
-                .key_clicks
-                .selected_profile_name()
-                .unwrap_or("");
-            let prompt = format!(
-                "{}\n{}",
-                self.t(
-                    "このゲームの設定を削除しますか？",
-                    "Delete this game profile?"
-                ),
-                name
-            );
-            if unsafe {
-                MessageBoxW(
-                    self.hwnd,
-                    wide(&prompt).as_ptr(),
-                    w!("Multi Point Clicker"),
-                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
-                )
-            } == IDYES
-            {
-                self.change_key_profile(ProfileChange::Delete(selected));
+            if let Some(id) = self.choose_key_profile_to_delete() {
+                let hwnd = self.hwnd;
+                self.delete_key_profile_with_confirmation(id, |prompt| unsafe {
+                    MessageBoxW(
+                        hwnd,
+                        wide(prompt).as_ptr(),
+                        w!("Multi Point Clicker"),
+                        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+                    ) == IDYES
+                });
             }
             return;
         }
@@ -2978,6 +3104,47 @@ impl App {
     }
 }
 
+fn reserved_key_hotkeys(
+    settings: &Settings,
+    hotkeys_ready: bool,
+    lock_hotkey_ready: bool,
+) -> Vec<(u32, u32)> {
+    let mut reserved = Vec::new();
+    if hotkeys_ready {
+        for action in ACTIONS {
+            if let Some(hotkey) = settings
+                .hotkeys
+                .get(action)
+                .and_then(|value| parse_hotkey(value))
+            {
+                if !reserved.contains(&hotkey) {
+                    reserved.push(hotkey);
+                }
+            }
+        }
+    }
+    let lock = (MOD_CONTROL | MOD_ALT, b'L' as u32);
+    if lock_hotkey_ready && !reserved.contains(&lock) {
+        reserved.push(lock);
+    }
+    reserved
+}
+fn profile_deletion_candidates(settings: &key_click::KeyClickSettings) -> Vec<(u64, String)> {
+    settings
+        .profiles
+        .iter()
+        .map(|profile| (profile.id, profile.name.clone()))
+        .collect()
+}
+fn fatal_key_error(code: &ErrorCode) -> bool {
+    !matches!(
+        code,
+        ErrorCode::KeyTarget
+            | ErrorCode::PointOutside
+            | ErrorCode::ScreenChanged
+            | ErrorCode::StickRange
+    )
+}
 fn combo_selection(hwnd: HWND) -> isize {
     unsafe { SendMessageW(hwnd, CB_GETCURSEL, 0, 0) }
 }
@@ -4613,7 +4780,10 @@ mod tests {
             assert_eq!(text(app.control(KEY_PROFILE)), name);
             assert!(app.message.contains("設定名"));
         }
-        app.change_key_profile(ProfileChange::Delete(second));
+        app.delete_key_profile_with_confirmation(second, |prompt| {
+            assert!(prompt.contains("Second"));
+            true
+        });
         assert!(
             app.settings
                 .key_clicks
@@ -4731,6 +4901,9 @@ mod tests {
             ErrorCode::ProfileName,
             ErrorCode::ProfileLimit,
             ErrorCode::InputCombination,
+            ErrorCode::InputRightButton,
+            ErrorCode::InputMouseMoved,
+            ErrorCode::InputMouseBusy,
             ErrorCode::InputInitialize,
         ] {
             let error: ClickerError = code.into();
@@ -4739,6 +4912,415 @@ mod tests {
             assert_ne!(japanese, english);
             assert!(!japanese.is_ascii());
             assert!(english.is_ascii() || error.code == ErrorCode::StickRange);
+        }
+    }
+    #[test]
+    fn reserved_hotkeys_include_shift_stop_and_only_registered_operations() {
+        let mut settings = Settings {
+            hotkeys: BTreeMap::from([
+                ("record_start".into(), "shift+a".into()),
+                ("record_stop".into(), "shift+s".into()),
+                ("click_start".into(), "ctrl+f11".into()),
+                ("click_stop".into(), "shift+w".into()),
+                ("unused".into(), "shift+d".into()),
+            ]),
+            ..Settings::default()
+        };
+        let operations = vec![
+            (MOD_SHIFT, b'A' as u32),
+            (MOD_SHIFT, b'S' as u32),
+            (MOD_CONTROL, VK_F11 as u32),
+            (MOD_SHIFT, b'W' as u32),
+        ];
+        let lock = (MOD_CONTROL | MOD_ALT, b'L' as u32);
+        let mut all = operations.clone();
+        all.push(lock);
+        assert_eq!(reserved_key_hotkeys(&settings, true, true), all);
+        assert_eq!(reserved_key_hotkeys(&settings, true, false), operations);
+        assert_eq!(reserved_key_hotkeys(&settings, false, true), vec![lock]);
+        assert!(reserved_key_hotkeys(&settings, false, false).is_empty());
+        settings.hotkeys.insert("click_stop".into(), "f13".into());
+        let reserved = reserved_key_hotkeys(&settings, true, true);
+        assert!(reserved.contains(&(0, VK_F13 as u32)));
+        assert!(!reserved.contains(&(MOD_SHIFT, b'W' as u32)));
+        assert!(!reserved.contains(&(MOD_SHIFT, b'D' as u32)));
+        settings
+            .hotkeys
+            .insert("record_start".into(), "invalid".into());
+        assert!(!reserved_key_hotkeys(&settings, true, true).contains(&(MOD_SHIFT, b'A' as u32)));
+    }
+    fn fill_profile_slots(app: &mut App) {
+        app.settings.key_clicks.profiles = (1..=key_click::MAX_PROFILES as u64)
+            .map(|id| key_click::GameProfile {
+                id,
+                name: format!("Saved {id}"),
+                ..key_click::GameProfile::default()
+            })
+            .collect();
+        app.settings.key_clicks.selected_profile = None;
+    }
+    #[test]
+    fn deleting_a_saved_profile_at_capacity_keeps_an_unselected_draft_and_allows_its_return() {
+        let mut fixture = TestApp::new();
+        let app = &mut fixture.app;
+        fill_profile_slots(app);
+        let point = saved_game_point();
+        app.settings.key_clicks.last_target = Some(point.game.clone());
+        app.settings.key_clicks.bindings = vec![KeyBinding {
+            key: Some(b'E' as u32),
+            position: Some(point.clone()),
+            right: true,
+            behavior: PressBehavior::Hold,
+            label: "Draft action".into(),
+        }];
+        app.settings.key_clicks.movement_mode = MovementMode::Stick;
+        app.settings.key_clicks.input_method = InputMethod::Mouse;
+        app.settings.key_clicks.stick.center = Some(point);
+        app.action(NAV_KEYS);
+        assert_eq!(unsafe { IsWindowEnabled(app.control(KEY_PROFILE_NEW)) }, 0);
+        assert_ne!(
+            unsafe { IsWindowEnabled(app.control(KEY_PROFILE_DELETE)) },
+            0
+        );
+        assert!(app.settings.key_clicks.selected_profile.is_none());
+        let candidates = profile_deletion_candidates(&app.settings.key_clicks);
+        assert_eq!(candidates.len(), key_click::MAX_PROFILES);
+        let (deleted, name) = candidates.last().unwrap().clone();
+        assert_eq!(name, format!("Saved {}", key_click::MAX_PROFILES));
+        set_text(app.control(KEY_PROFILE), "Draft name");
+        set_text(app.control(KEY_STICK_RADIUS), "140");
+        set_text(app.control(KEY_LABEL), "Pending draft action");
+        assert!(app.commit());
+        let draft = app.settings.key_clicks.clone();
+        let saved_profiles = draft.profiles.clone();
+        select_key_combo(app, KEY_PROFILE, 0);
+        assert_eq!(app.settings.key_clicks.selected_profile, None);
+        assert_eq!(app.settings.key_clicks.profiles, saved_profiles);
+        assert_eq!(text(app.control(KEY_LABEL)), "Pending draft action");
+        app.delete_key_profile_with_confirmation(deleted, |prompt| {
+            assert!(prompt.contains(&name));
+            true
+        });
+        assert_eq!(
+            app.settings.key_clicks.profiles.len(),
+            key_click::MAX_PROFILES - 1
+        );
+        assert_eq!(app.settings.key_clicks.selected_profile, None);
+        assert_eq!(app.settings.key_clicks.bindings, draft.bindings);
+        assert_eq!(app.settings.key_clicks.last_target, draft.last_target);
+        assert_eq!(app.settings.key_clicks.stick, draft.stick);
+        assert_eq!(app.settings.key_clicks.movement_mode, draft.movement_mode);
+        assert_eq!(app.settings.key_clicks.input_method, draft.input_method);
+        assert_eq!(text(app.control(KEY_PROFILE)), "Draft name");
+        assert_eq!(text(app.control(KEY_STICK_RADIUS)), "140");
+        assert_ne!(unsafe { IsWindowEnabled(app.control(KEY_PROFILE_NEW)) }, 0);
+        let (loaded, _) = Settings::load(&app.path).unwrap();
+        assert_eq!(loaded.key_clicks, app.settings.key_clicks);
+        select_key_combo(app, KEY_PROFILE, 0);
+        assert_eq!(app.settings.key_clicks.selected_profile, Some(1));
+        assert_eq!(
+            app.settings.key_clicks.profiles.len(),
+            key_click::MAX_PROFILES
+        );
+        let archived = app
+            .settings
+            .key_clicks
+            .profiles
+            .iter()
+            .find(|profile| profile.bindings == draft.bindings)
+            .unwrap();
+        let archived_id = archived.id;
+        assert_eq!(archived.stick, draft.stick);
+        let index = app
+            .settings
+            .key_clicks
+            .profiles
+            .iter()
+            .position(|p| p.id == archived_id)
+            .unwrap();
+        select_key_combo(app, KEY_PROFILE, index);
+        assert_eq!(app.settings.key_clicks.selected_profile, Some(archived_id));
+        assert_eq!(app.settings.key_clicks.bindings, draft.bindings);
+        assert_eq!(app.settings.key_clicks.stick, draft.stick);
+        assert_eq!(text(app.control(KEY_LABEL)), "Pending draft action");
+        assert_eq!(text(app.control(KEY_STICK_RADIUS)), "140");
+        assert!(app.key_controller.is_none());
+        assert_eq!(unsafe { IsWindowVisible(app.hwnd) }, 0);
+    }
+    #[test]
+    fn an_empty_unselected_editor_at_capacity_can_delete_and_select_without_creating_a_draft() {
+        let mut fixture = TestApp::new();
+        let app = &mut fixture.app;
+        fill_profile_slots(app);
+        app.settings.key_clicks.input_method = InputMethod::Touch;
+        app.action(NAV_KEYS);
+        assert_ne!(
+            unsafe { IsWindowEnabled(app.control(KEY_PROFILE_DELETE)) },
+            0
+        );
+        let candidates = profile_deletion_candidates(&app.settings.key_clicks);
+        let (deleted, name) = candidates.last().unwrap().clone();
+        app.delete_key_profile_with_confirmation(deleted, |prompt| {
+            assert!(prompt.contains(&name));
+            true
+        });
+        assert_eq!(app.settings.key_clicks.selected_profile, None);
+        assert!(app.settings.key_clicks.bindings.is_empty());
+        assert!(app.settings.key_clicks.last_target.is_none());
+        assert_eq!(
+            app.settings.key_clicks.profiles.len(),
+            key_click::MAX_PROFILES - 1
+        );
+        select_key_combo(app, KEY_PROFILE, 0);
+        assert_eq!(app.settings.key_clicks.selected_profile, Some(1));
+        assert_eq!(
+            app.settings.key_clicks.profiles.len(),
+            key_click::MAX_PROFILES - 1
+        );
+        let (loaded, _) = Settings::load(&app.path).unwrap();
+        assert_eq!(loaded.key_clicks, app.settings.key_clicks);
+    }
+    #[test]
+    fn deleting_an_unselected_saved_profile_requires_confirmation_of_its_name() {
+        let mut fixture = TestApp::new();
+        let app = &mut fixture.app;
+        fill_profile_slots(app);
+        app.action(NAV_KEYS);
+        let previous = app.settings.key_clicks.clone();
+        let mut confirmed = false;
+        app.delete_key_profile_with_confirmation(2, |prompt| {
+            confirmed = true;
+            assert!(prompt.contains("Saved 2"));
+            false
+        });
+        assert!(confirmed);
+        assert_eq!(app.settings.key_clicks, previous);
+        app.delete_key_profile_with_confirmation(u64::MAX, |_| {
+            panic!("An invalid ID has no deletion prompt")
+        });
+        assert_eq!(app.settings.key_clicks, previous);
+    }
+    #[test]
+    fn invalid_profile_edits_keep_the_enabled_state_and_never_retire_the_current_target() {
+        let mut fixture = TestApp::new();
+        let app = &mut fixture.app;
+        app.action(NAV_KEYS);
+        set_text(app.control(KEY_PROFILE), "First");
+        app.action(KEY_PROFILE_SAVE);
+        let first = app.settings.key_clicks.selected_profile;
+        app.action(KEY_MOVE_STICK);
+        app.action(KEY_ENABLE);
+        assert!(app.settings.key_clicks.enabled);
+        let previous = app.settings.key_clicks.clone();
+        let mut stopped = 0;
+        // The token represents a live target without constructing a native controller or target.
+        let mut target = Some(7usize);
+        for radius in ["invalid", "3", "2049"] {
+            set_text(app.control(KEY_STICK_RADIUS), radius);
+            app.change_key_profile_using(ProfileChange::New, |app| {
+                stopped += 1;
+                target = None;
+                app.stop_key_profile_runtime();
+            });
+            assert_eq!(stopped, 0);
+            assert_eq!(target, Some(7));
+            assert_eq!(app.settings.key_clicks, previous);
+            assert_eq!(app.settings.key_clicks.selected_profile, first);
+            assert_eq!(
+                unsafe { SendMessageW(app.control(KEY_ENABLE), BM_GETCHECK, 0, 0) },
+                1
+            );
+            assert_eq!(text(app.control(KEY_STICK_RADIUS)), radius);
+            assert!(app.key_controller.is_none());
+        }
+        set_text(app.control(KEY_STICK_RADIUS), "140");
+        app.change_key_profile_using(ProfileChange::New, |app| {
+            stopped += 1;
+            target = None;
+            app.stop_key_profile_runtime();
+        });
+        assert_eq!(stopped, 1);
+        assert!(target.is_none());
+        assert!(!app.settings.key_clicks.enabled);
+        assert_eq!(app.settings.key_clicks.selected_profile, None);
+        assert_eq!(app.settings.key_clicks.profiles[0].stick.radius_px, 140);
+        assert_eq!(unsafe { IsWindowVisible(app.hwnd) }, 0);
+    }
+    #[test]
+    fn input_warnings_explain_the_correct_recovery_in_both_languages() {
+        for (code, japanese_terms, english_terms) in [
+            (
+                ErrorCode::InputRightButton,
+                ["タッチ", "右クリック", "マウス"],
+                ["Touch", "right-click", "Choose Mouse"],
+            ),
+            (
+                ErrorCode::InputMouseMoved,
+                ["手動", "キーを離して", "押し直し"],
+                ["Manual mouse", "Release the assigned key", "press it again"],
+            ),
+            (
+                ErrorCode::InputMouseBusy,
+                ["物理マウス", "ボタン", "押し直し"],
+                [
+                    "physical mouse button",
+                    "Release the mouse button",
+                    "press the key again",
+                ],
+            ),
+        ] {
+            let error: ClickerError = code.into();
+            let japanese = error_text(&error, true);
+            let english = error_text(&error, false);
+            for term in japanese_terms {
+                assert!(japanese.contains(term), "{japanese}");
+            }
+            for term in english_terms {
+                assert!(english.contains(term), "{english}");
+            }
+            assert!(!japanese.contains("同時"));
+            assert!(!english.contains("at once"));
+        }
+        let combination: ClickerError = ErrorCode::InputCombination.into();
+        assert!(error_text(&combination, true).contains("同時に保持"));
+        assert!(error_text(&combination, false).contains("hold separate positions at once"));
+    }
+    #[test]
+    fn key_error_recovery_is_limited_to_target_position_size_and_stick_guidance() {
+        for code in [
+            ErrorCode::KeyTarget,
+            ErrorCode::PointOutside,
+            ErrorCode::ScreenChanged,
+            ErrorCode::StickRange,
+        ] {
+            assert!(!fatal_key_error(&code), "{code:?}");
+        }
+        for code in [
+            ErrorCode::InputSend,
+            ErrorCode::InputInitialize,
+            ErrorCode::WorkerPanic,
+            ErrorCode::InputMonitor,
+            ErrorCode::ThreadStart,
+            ErrorCode::ScreenUnavailable,
+            ErrorCode::KeyMapping,
+            ErrorCode::InputCombination,
+            ErrorCode::InputRightButton,
+            ErrorCode::InputMouseMoved,
+            ErrorCode::InputMouseBusy,
+            ErrorCode::Other,
+        ] {
+            assert!(fatal_key_error(&code), "{code:?}");
+        }
+    }
+    #[test]
+    fn fatal_key_errors_disable_and_persist_without_starting_a_controller() {
+        for code in [
+            ErrorCode::InputSend,
+            ErrorCode::InputInitialize,
+            ErrorCode::WorkerPanic,
+            ErrorCode::InputMonitor,
+            ErrorCode::ThreadStart,
+            ErrorCode::ScreenUnavailable,
+        ] {
+            let mut fixture = TestApp::new();
+            let app = &mut fixture.app;
+            app.settings.lang = "en".into();
+            app.settings.interval_ticks = 1;
+            app.settings.points.push(Point {
+                x: 31,
+                y: 42,
+                interval_ticks: Some(7),
+            });
+            app.settings.delay_ms = 7000;
+            app.rebuild();
+            app.action(NAV_KEYS);
+            app.action(KEY_WASD);
+            set_text(app.control(KEY_PROFILE), "First");
+            app.action(KEY_PROFILE_SAVE);
+            app.action(KEY_ENABLE);
+            assert!(app.settings.key_clicks.enabled);
+            assert_eq!(
+                unsafe { SendMessageW(app.control(KEY_ENABLE), BM_GETCHECK, 0, 0) },
+                BST_CHECKED as isize
+            );
+            let mut expected = app.settings.clone();
+            expected.key_clicks.enabled = false;
+            let error = ClickerError::with_detail(code, "Input failure detail");
+            let detail = error_text(&error, false);
+            app.handle_key_error(error);
+            assert!(!app.settings.key_clicks.enabled);
+            assert_eq!(
+                unsafe { SendMessageW(app.control(KEY_ENABLE), BM_GETCHECK, 0, 0) },
+                BST_UNCHECKED as isize
+            );
+            assert!(app.key_controller.is_none());
+            assert!(!app.saved_error);
+            app.update_stats();
+            app.update_stats();
+            let status = text(app.control(KEY_STATUS));
+            assert!(status.contains("Disabled"));
+            assert!(!status.contains("Ready"));
+            assert!(text(app.control(MESSAGE)).contains("Key controls stopped"));
+            assert!(app.message.contains(&detail));
+            let (loaded, _) = Settings::load(&app.path).unwrap();
+            assert_eq!(
+                serde_json::to_value(&loaded).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(unsafe { IsWindowVisible(app.hwnd) }, 0);
+        }
+    }
+    #[test]
+    fn transient_key_errors_and_stick_guidance_keep_key_controls_enabled() {
+        for code in [
+            ErrorCode::KeyTarget,
+            ErrorCode::PointOutside,
+            ErrorCode::ScreenChanged,
+            ErrorCode::StickRange,
+        ] {
+            let mut fixture = TestApp::new();
+            let app = &mut fixture.app;
+            app.action(NAV_KEYS);
+            app.action(KEY_ENABLE);
+            let previous = app.settings.key_clicks.clone();
+            let error: ClickerError = code.into();
+            let detail = error_text(&error, true);
+            app.handle_key_error(error);
+            app.update_stats();
+            assert_eq!(app.settings.key_clicks, previous);
+            assert_eq!(
+                unsafe { SendMessageW(app.control(KEY_ENABLE), BM_GETCHECK, 0, 0) },
+                BST_CHECKED as isize
+            );
+            assert_eq!(app.message, detail);
+            assert!(!app.saved_error);
+            assert!(app.key_controller.is_none());
+        }
+    }
+    #[test]
+    fn fatal_key_errors_on_other_tabs_keep_pending_editors_and_unrelated_settings() {
+        for tab in [NAV_MAIN, NAV_SETTINGS] {
+            let mut fixture = TestApp::new();
+            let app = &mut fixture.app;
+            app.action(NAV_KEYS);
+            app.action(KEY_ENABLE);
+            app.action(tab);
+            let editor = if tab == NAV_MAIN { INTERVAL } else { DELAY };
+            set_text(app.control(editor), "pending edit");
+            let mut expected = app.settings.clone();
+            expected.key_clicks.enabled = false;
+            let current_tab = app.tab;
+            app.handle_key_error(ErrorCode::InputSend.into());
+            app.update_stats();
+            assert_eq!(app.tab, current_tab);
+            assert_eq!(text(app.control(editor)), "pending edit");
+            assert!(!app.settings.key_clicks.enabled);
+            assert!(text(app.control(MESSAGE)).contains("キー操作を停止"));
+            let (loaded, _) = Settings::load(&app.path).unwrap();
+            assert_eq!(
+                serde_json::to_value(&loaded).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
         }
     }
     struct TestApp {

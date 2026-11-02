@@ -29,6 +29,13 @@ impl From<POINT> for Pixel {
         }
     }
 }
+impl Pixel {
+    fn matches_injected(self, expected: Self) -> bool {
+        // Absolute-coordinate quantization may land one pixel either side.
+        // Physical activity is tracked separately and still always wins.
+        self.x.abs_diff(expected.x) <= 1 && self.y.abs_diff(expected.y) <= 1
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Desktop {
     pub left: i32,
@@ -79,10 +86,23 @@ pub(super) trait Sink {
 
 type InitializeTouch = unsafe extern "system" fn(u32, u32) -> i32;
 type InjectTouch = unsafe extern "system" fn(u32, *const POINTER_TOUCH_INFO) -> i32;
+#[derive(Clone, Copy)]
 struct TouchApi {
     inject: InjectTouch,
 }
 impl TouchApi {
+    fn shared() -> Result<Self, ClickerError> {
+        static API: Mutex<Option<TouchApi>> = Mutex::new(None);
+        let mut cached = API
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(api) = *cached {
+            return Ok(api);
+        }
+        let api = Self::load()?;
+        *cached = Some(api);
+        Ok(api)
+    }
     fn load() -> Result<Self, ClickerError> {
         // Resolve the optional entry points before recording any contact. Missing
         // exports must not prevent Mouse mode from starting or trigger stray UPs.
@@ -168,7 +188,7 @@ impl Sink for NativeSink {
     }
     fn initialize_touch(&mut self) -> Result<(), ClickerError> {
         if self.touch.is_none() {
-            self.touch = Some(TouchApi::load()?);
+            self.touch = Some(TouchApi::shared()?);
         }
         Ok(())
     }
@@ -301,11 +321,8 @@ impl<S: Sink> Runtime<S> {
             completed: 0,
         }
     }
-    fn warn(&mut self, detail: &str) {
-        self.warning = Some(ClickerError::with_detail(
-            ErrorCode::InputCombination,
-            detail,
-        ));
+    fn warn(&mut self, code: ErrorCode, detail: &str) {
+        self.warning = Some(ClickerError::with_detail(code, detail));
     }
     pub fn frame(
         &mut self,
@@ -347,7 +364,7 @@ impl<S: Sink> Runtime<S> {
                 let mut resolved = Vec::with_capacity(actions.len());
                 for action in actions {
                     if action.right {
-                        self.warn("Touch cannot send right-button actions; select Mouse for this setting.");
+                        self.warn(ErrorCode::InputRightButton, "Touch cannot send right-button actions; select Mouse for this setting.");
                         self.planner.reject(action.id, now);
                         continue;
                     }
@@ -505,7 +522,9 @@ impl<S: Sink> Runtime<S> {
     ) -> Result<(), ClickerError> {
         let state = self.sink.mouse_state()?;
         if let Some(owner) = &self.mouse {
-            if state.physical.activity != owner.activity || state.position != owner.last {
+            if state.physical.activity != owner.activity
+                || !state.position.matches_injected(owner.last)
+            {
                 let id = owner.id;
                 self.release_mouse(now, false)?;
                 self.restore = None;
@@ -514,7 +533,7 @@ impl<S: Sink> Runtime<S> {
                     self.mouse_blocked.insert(action.id);
                     self.planner.reject(action.id, now);
                 }
-                self.warn("Mouse movement interrupted the virtual control; release the source keys before using it again.");
+                self.warn(ErrorCode::InputMouseMoved, "Mouse movement interrupted the virtual control; release the source keys before using it again.");
             }
         }
         if let Some(owner) = &self.mouse {
@@ -531,15 +550,17 @@ impl<S: Sink> Runtime<S> {
                     .iter()
                     .find(|action| !self.mouse_blocked.contains(&action.id))
             });
+        let independent_hold = selected.is_some_and(|action| !action.pulse)
+            || actions.iter().any(|action| !action.pulse);
         for action in actions {
-            if selected.is_none_or(|selected| selected.id != action.id)
-                || self.mouse_blocked.contains(&action.id)
+            if self.mouse_blocked.contains(&action.id)
+                || (independent_hold && selected.is_none_or(|selected| selected.id != action.id))
             {
                 self.planner.reject(action.id, now);
             }
         }
-        if actions.len() > 1 {
-            self.warn("Mouse has one pointer and cannot hold separate positions or add an independent click while holding a control.");
+        if actions.len() > 1 && independent_hold {
+            self.warn(ErrorCode::InputCombination, "Mouse has one pointer and cannot hold separate positions or add an independent click while holding a control.");
         }
         let Some(action) = selected else {
             return Ok(());
@@ -549,11 +570,17 @@ impl<S: Sink> Runtime<S> {
             return Ok(());
         }
         if self.mouse.is_none() {
+            // A preceding one-shot click owns its release dwell. Leave other
+            // fresh pulses pending (bounded by MAX_PRESS_AGE), rather than
+            // turning ordinary Click+Click into a rejected multi-hold.
+            if self.restore.is_some() {
+                return Ok(());
+            }
             let state = self.sink.mouse_state()?;
-            if self.restore.is_some() || state.physical.left || state.physical.right {
+            if state.physical.left || state.physical.right {
                 self.planner.reject(action.id, now);
                 self.mouse_blocked.insert(action.id);
-                self.warn("Mouse is in use; the additional action was skipped to preserve the current input.");
+                self.warn(ErrorCode::InputMouseBusy, "Mouse is in use; the additional action was skipped to preserve the current input.");
                 return Ok(());
             }
         }
@@ -572,7 +599,7 @@ impl<S: Sink> Runtime<S> {
             if self.restore.is_some() || state.physical.left || state.physical.right {
                 self.planner.reject(action.id, now);
                 self.mouse_blocked.insert(action.id);
-                self.warn("Mouse is in use; the additional action was skipped to preserve the current input.");
+                self.warn(ErrorCode::InputMouseBusy, "Mouse is in use; the additional action was skipped to preserve the current input.");
                 return Ok(());
             }
             if !allowed() {
@@ -642,6 +669,7 @@ impl<S: Sink> Runtime<S> {
             self.mouse = None;
             self.restore = None;
             self.warn(
+                ErrorCode::InputMouseBusy,
                 "A physical mouse press took over the button; its release is left to the user.",
             );
             return Ok(());
@@ -689,7 +717,7 @@ impl<S: Sink> Runtime<S> {
         }
         let state = self.sink.mouse_state()?;
         if state.physical.activity == restore.activity
-            && state.position == restore.last
+            && state.position.matches_injected(restore.last)
             && !state.physical.left
             && !state.physical.right
             && self.sink.desktop()? == self.desktop.unwrap()

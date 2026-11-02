@@ -242,6 +242,9 @@ impl KeyClickSettings {
     pub fn new_profile(&mut self) -> Result<(), ClickerError> {
         self.update_profiles(|settings| {
             settings.preserve_current_profile()?;
+            if settings.profiles.len() >= MAX_PROFILES {
+                return Err(ErrorCode::ProfileLimit.into());
+            }
             settings.reset_current_profile();
             Ok(())
         })
@@ -376,10 +379,9 @@ impl KeyClickSettings {
         let name = (1..=MAX_PROFILES + 1)
             .map(|number| format!("Settings {number}"))
             .find(|name| {
-                !self
-                    .profiles
-                    .iter()
-                    .any(|profile| profile.name.trim().eq_ignore_ascii_case(name))
+                !self.profiles.iter().any(|profile| {
+                    profile_name_key(&profile.name).ok() == profile_name_key(name).ok()
+                })
             })
             .ok_or(ErrorCode::ProfileLimit)?;
         self.profiles.push(self.current_profile(id, name));
@@ -1132,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_profile_list_keeps_saved_edits_and_rejects_only_meaningful_new_drafts() {
+    fn a_full_profile_list_rejects_new_and_can_recover_an_existing_unnamed_draft() {
         let mut settings = configured_settings();
         settings.profiles = (1..=MAX_PROFILES as u64)
             .map(|id| GameProfile {
@@ -1143,19 +1145,24 @@ mod tests {
             .collect();
         settings.selected_profile = Some(1);
         settings.bindings[0].label = "Keep at capacity".into();
-        settings.new_profile().unwrap();
         for _ in 0..8 {
-            settings.new_profile().unwrap();
+            assert_profile_error(&mut settings, ErrorCode::ProfileLimit, |settings| {
+                settings.new_profile()
+            });
             assert_eq!(settings.profiles.len(), MAX_PROFILES);
-            assert_eq!(settings.profiles[0].bindings[0].label, "Keep at capacity");
+            assert_eq!(settings.bindings[0].label, "Keep at capacity");
+            assert_eq!(settings.selected_profile, Some(1));
         }
+        settings.sync_selected_profile().unwrap();
         settings.select_profile(1).unwrap();
         assert_eq!(settings.bindings[0].label, "Keep at capacity");
-        settings.new_profile().unwrap();
-        settings.bindings.push(KeyBinding {
+        // Recover data saved by an earlier implementation that allowed New at
+        // capacity; deleting an inactive profile must leave this editor intact.
+        settings.selected_profile = None;
+        settings.bindings = vec![KeyBinding {
             label: "Unfinished new draft".into(),
             ..KeyBinding::default()
-        });
+        }];
         assert_profile_error(&mut settings, ErrorCode::ProfileLimit, |settings| {
             settings.new_profile()
         });

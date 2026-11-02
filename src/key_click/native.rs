@@ -384,8 +384,14 @@ impl<S: Sink> Shared<S> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(warning);
         }
         if let Err(error) = result {
-            self.active.store(false, Ordering::Release);
-            self.generation.fetch_add(1, Ordering::AcqRel);
+            let transient = matches!(
+                &error.code,
+                ErrorCode::KeyTarget | ErrorCode::PointOutside | ErrorCode::ScreenChanged
+            );
+            if !transient {
+                self.active.store(false, Ordering::Release);
+                self.generation.fetch_add(1, Ordering::AcqRel);
+            }
             let mut source = self
                 .source
                 .lock()
@@ -393,8 +399,15 @@ impl<S: Sink> Shared<S> {
             source.suspend();
             let state = source.snapshot();
             drop(source);
-            let _ = output.halt(&state);
-            self.report(error);
+            let failure = if let Err(cleanup) = output.halt(&state) {
+                self.active.store(false, Ordering::Release);
+                self.generation.fetch_add(1, Ordering::AcqRel);
+                let detail = format!("{error}; cleanup: {cleanup}");
+                ClickerError::with_detail(cleanup.code, detail)
+            } else {
+                error
+            };
+            self.report(failure);
         }
     }
 }
@@ -728,8 +741,20 @@ impl Controller {
         }
     }
     pub fn configure(&mut self, target: Option<Arc<Target>>, settings: &KeyClickSettings) {
+        self.configure_with_hotkeys(target, settings, &[]);
+    }
+    pub fn configure_with_hotkeys(
+        &mut self,
+        target: Option<Arc<Target>>,
+        settings: &KeyClickSettings,
+        hotkeys: &[(u32, u32)],
+    ) {
         let size = target.as_ref().and_then(|target| target.client_size().ok());
-        let source = ActiveSettings::from(settings);
+        let mut source = ActiveSettings::from(settings);
+        source.operation_hotkeys = hotkeys
+            .iter()
+            .map(|(mods, key)| (*mods & 0x0f, *key))
+            .collect();
         if self.shared.snapshot.read().is_ok_and(|old| {
             old.source == source
                 && old.size == size
@@ -776,7 +801,7 @@ impl Controller {
                 .any(|binding| binding.right && binding.position.is_some())
         {
             Some(ClickerError::with_detail(
-                ErrorCode::InputCombination,
+                ErrorCode::InputRightButton,
                 "Touch cannot send right-button actions; select Mouse for this setting.",
             ))
         } else {
@@ -787,20 +812,16 @@ impl Controller {
             .warning
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = warning;
-        if drained {
-            *self
-                .shared
+        if drained
+            && source.movement_mode == MovementMode::Stick
+            && source.stick.center.is_some()
+            && !stick_valid
+        {
+            self.shared
                 .error
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = if source.movement_mode
-                == MovementMode::Stick
-                && source.stick.center.is_some()
-                && !stick_valid
-            {
-                Some(ErrorCode::StickRange.into())
-            } else {
-                None
-            };
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert_with(|| ErrorCode::StickRange.into());
         }
         *self
             .shared
