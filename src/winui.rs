@@ -3148,7 +3148,10 @@ pub fn run() -> i32 {
                 "Alt+ShiftによるWindowsの入力言語切り替えを抑止できません。",
                 "Cannot suppress Windows input-language switching with Alt+Shift.",
             );
-            let message = format!("{warning} ({error})");
+            let message = match error.raw_os_error() {
+                Some(code) => format!("{warning} ({code})"),
+                None => warning.to_string(),
+            };
             if !app.message.is_empty() {
                 app.message.push('\n');
             }
