@@ -313,25 +313,9 @@ impl Settings {
             drop(file);
             #[cfg(windows)]
             {
-                use std::os::windows::ffi::OsStrExt;
-                use windows_sys::Win32::Storage::FileSystem::{
-                    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-                };
-                let source: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
-                let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-                if unsafe {
-                    MoveFileExW(
-                        source.as_ptr(),
-                        destination.as_ptr(),
-                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                    )
-                } == 0
-                {
-                    return Err(ClickerError::with_detail(
-                        ErrorCode::SettingsWrite,
-                        std::io::Error::last_os_error().to_string(),
-                    ));
-                }
+                replace_settings_file(&temp, path, std::thread::sleep).map_err(|e| {
+                    ClickerError::with_detail(ErrorCode::SettingsWrite, e.to_string())
+                })?;
             }
             #[cfg(not(windows))]
             fs::rename(&temp, path)
@@ -343,6 +327,46 @@ impl Settings {
         }
         result
     }
+}
+
+#[cfg(windows)]
+fn replace_settings_file(
+    temp: &Path,
+    path: &Path,
+    mut retry_wait: impl FnMut(std::time::Duration),
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::{ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION},
+        Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
+    };
+    let source: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    for attempt in 0..8 {
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } != 0
+        {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if attempt == 7
+            || !matches!(
+                error.raw_os_error().map(|code| code as u32),
+                Some(ERROR_ACCESS_DENIED | ERROR_LOCK_VIOLATION | ERROR_SHARING_VIOLATION)
+            )
+        {
+            return Err(error);
+        }
+        // A reader without delete sharing can briefly prevent atomic replacement.
+        // Keep both files intact while waiting; permanent errors still reach UI.
+        retry_wait(std::time::Duration::from_millis(5 * (attempt + 1)));
+    }
+    unreachable!()
 }
 
 fn preserve_settings_backup(backup: &Path, raw: &[u8]) -> Result<(), ClickerError> {
@@ -1015,5 +1039,66 @@ mod tests {
                 .exists()
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_settings_replacement_waits_for_a_reader_without_delete_sharing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        let dir = SettingsTestDirectory::new("replace-reader");
+        let path = dir.0.join("settings.json");
+        let temp = dir.0.join("ready.tmp");
+        fs::write(&path, b"original").unwrap();
+        fs::write(&temp, b"replacement").unwrap();
+        let mut reader = Some(
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(&path)
+                .unwrap(),
+        );
+        let mut waits = 0;
+        replace_settings_file(&temp, &path, |_| {
+            waits += 1;
+            assert_eq!(fs::read(&path).unwrap(), b"original");
+            assert_eq!(fs::read(&temp).unwrap(), b"replacement");
+            drop(reader.take());
+        })
+        .unwrap();
+        assert!(waits > 0 && waits <= 7);
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        assert!(!temp.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_permanently_locked_settings_file_preserves_original_and_reports_failure() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        let dir = SettingsTestDirectory::new("replace-locked");
+        let path = dir.0.join("settings.json");
+        Settings::default().save(&path).unwrap();
+        let original = fs::read(&path).unwrap();
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
+        let changed = Settings {
+            repeat: 17,
+            ..Settings::default()
+        };
+        let error = changed.save(&path).unwrap_err();
+        assert_eq!(error.code, ErrorCode::SettingsWrite);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(
+            !path
+                .with_extension(format!("{}.tmp", std::process::id()))
+                .exists()
+        );
+        drop(reader);
+        changed.save(&path).unwrap();
+        assert_eq!(Settings::load(&path).unwrap().0.repeat, 17);
     }
 }

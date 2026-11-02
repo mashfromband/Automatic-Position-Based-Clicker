@@ -421,6 +421,12 @@ impl<S: Sink> Runtime<S> {
             return Ok(());
         }
         self.sink.initialize_touch()?;
+        desired.retain(|id, _| {
+            self.contacts.contains_key(id) || self.planner.can_start(*id, self.sink.clock(now))
+        });
+        if desired.is_empty() && self.contacts.is_empty() {
+            return Ok(());
+        }
         let mut frame = Vec::new();
         for (&id, contact) in &self.contacts {
             let (phase, point) = if let Some(action) = desired.get(&id) {
@@ -603,6 +609,10 @@ impl<S: Sink> Runtime<S> {
                 return Ok(());
             }
             if !allowed() {
+                return Ok(());
+            }
+            if !self.planner.can_start(action.id, self.sink.clock(now)) {
+                self.planner.reject(action.id, now);
                 return Ok(());
             }
             self.mouse = Some(MouseOwner {

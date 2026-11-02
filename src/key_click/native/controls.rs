@@ -84,6 +84,7 @@ pub(super) struct SourceSnapshot {
     down: [bool; 256],
     presses: [u64; 256],
     pressed_at: [Option<Instant>; 256],
+    press_order: [u64; 256],
     pub shortcut: bool,
 }
 
@@ -100,6 +101,8 @@ pub(super) struct SourceKeyState {
     consumed: [bool; 256],
     presses: [u64; 256],
     pressed_at: [Option<Instant>; 256],
+    press_order: [u64; 256],
+    next_order: u64,
 }
 impl Default for SourceKeyState {
     fn default() -> Self {
@@ -109,6 +112,8 @@ impl Default for SourceKeyState {
             consumed: [false; 256],
             presses: [0; 256],
             pressed_at: [None; 256],
+            press_order: [0; 256],
+            next_order: 0,
         }
     }
 }
@@ -202,6 +207,7 @@ impl SourceKeyState {
             down: self.accepted,
             presses: self.presses,
             pressed_at: self.pressed_at,
+            press_order: self.press_order,
             shortcut: self.shortcut_down(),
         }
     }
@@ -260,6 +266,8 @@ impl SourceKeyState {
         false
     }
     fn record_press(&mut self, key: usize, now: Instant) {
+        self.next_order = self.next_order.wrapping_add(1);
+        self.press_order[key] = self.next_order;
         self.presses[key] = self.presses[key].wrapping_add(1);
         self.pressed_at[key] = Some(now);
     }
@@ -282,6 +290,7 @@ enum PulsePhase {
 struct Pulse {
     action: Action,
     phase: PulsePhase,
+    order: u64,
 }
 pub(super) struct Planner {
     seen: [u64; 256],
@@ -296,6 +305,15 @@ impl Default for Planner {
     }
 }
 impl Planner {
+    pub fn can_start(&self, id: usize, now: Instant) -> bool {
+        match self.pulses.get(&id).map(|pulse| &pulse.phase) {
+            Some(PulsePhase::Pending(created)) => {
+                now.saturating_duration_since(*created) <= MAX_PRESS_AGE
+            }
+            Some(PulsePhase::Cooling(_) | PulsePhase::Releasing) => false,
+            _ => true,
+        }
+    }
     pub fn reset(&mut self, source: &SourceSnapshot) {
         self.seen = source.presses;
         self.pulses.clear();
@@ -380,16 +398,17 @@ impl Planner {
                 if allowed {
                     result.push(action);
                 }
-            } else if source.presses[key as usize] != self.seen[key as usize]
-                && !self.pulses.contains_key(&id)
-                && source.pressed_at[key as usize]
-                    .is_some_and(|at| now.saturating_duration_since(at) <= MAX_PRESS_AGE)
-            {
+            } else if let Some(created) = source.pressed_at[key as usize].filter(|at| {
+                source.presses[key as usize] != self.seen[key as usize]
+                    && !self.pulses.contains_key(&id)
+                    && now.saturating_duration_since(*at) <= MAX_PRESS_AGE
+            }) {
                 self.pulses.insert(
                     id,
                     Pulse {
                         action,
-                        phase: PulsePhase::Pending(now),
+                        phase: PulsePhase::Pending(created),
+                        order: source.press_order[key as usize],
                     },
                 );
             }
@@ -418,17 +437,18 @@ impl Planner {
                 }
             }
         }
-        result.extend(
-            self.pulses
-                .values()
-                .filter(|pulse| {
-                    matches!(
-                        pulse.phase,
-                        PulsePhase::Pending(_) | PulsePhase::Pressing(_)
-                    )
-                })
-                .map(|pulse| pulse.action.clone()),
-        );
+        let mut pulses: Vec<_> = self
+            .pulses
+            .values()
+            .filter(|pulse| {
+                matches!(
+                    pulse.phase,
+                    PulsePhase::Pending(_) | PulsePhase::Pressing(_)
+                )
+            })
+            .collect();
+        pulses.sort_unstable_by_key(|pulse| pulse.order);
+        result.extend(pulses.into_iter().map(|pulse| pulse.action.clone()));
         self.seen = source.presses;
         result
     }

@@ -896,6 +896,58 @@ fn ordinary_mouse_clicks_wait_in_order_but_expired_and_cancelled_taps_do_not_rep
 }
 
 #[test]
+fn mouse_clicks_preserve_acceptance_order_including_equal_timestamps() {
+    for last_at in [10, 20] {
+        let mut h = Harness::new(
+            InputMethod::Mouse,
+            MovementMode::Buttons,
+            PressBehavior::Click,
+        );
+        h.key(b'W' as u32, true, 0);
+        h.frame(0).unwrap();
+        h.key(0x20, true, 10);
+        h.frame(10).unwrap();
+        h.key(b'A' as u32, true, last_at);
+        h.frame(last_at).unwrap();
+        for at in [50, 100, 150, 200, 250, 300] {
+            h.frame(at).unwrap();
+        }
+        let packets = h.runtime.sink.mouse_packets();
+        let positions: Vec<_> = packets
+            .windows(2)
+            .filter(|pair| pair[1].flags & MOUSEEVENTF_LEFTDOWN != 0)
+            .map(|pair| pair[0].point.unwrap())
+            .collect();
+        assert_eq!(
+            positions,
+            [
+                Pixel { x: 100, y: 150 },
+                Pixel { x: 220, y: 150 },
+                Pixel { x: 130, y: 150 }
+            ]
+        );
+        assert_eq!(h.runtime.completed, 3);
+    }
+}
+
+#[test]
+fn delayed_frame_does_not_extend_the_original_click_deadline() {
+    let mut h = Harness::new(
+        InputMethod::Mouse,
+        MovementMode::Buttons,
+        PressBehavior::Click,
+    );
+    h.key(b'W' as u32, true, 0);
+    h.key(0x20, true, 0);
+    h.frame(200).unwrap();
+    h.frame(250).unwrap();
+    h.frame(300).unwrap();
+    h.frame(400).unwrap();
+    assert_eq!(h.runtime.sink.downs(), 1);
+    assert_eq!(h.runtime.completed, 1);
+}
+
+#[test]
 fn registered_shift_hotkeys_take_priority_without_disabling_other_shift_movement() {
     for method in [InputMethod::Mouse, InputMethod::Touch] {
         for mode in [MovementMode::Buttons, MovementMode::Stick] {

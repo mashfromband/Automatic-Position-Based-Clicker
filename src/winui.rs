@@ -325,6 +325,15 @@ fn error_text(error: &ClickerError, japanese: bool) -> String {
         ),
     };
     let base = if japanese { pair.0 } else { pair.1 };
+    if matches!(
+        error.code,
+        ErrorCode::InputCombination
+            | ErrorCode::InputRightButton
+            | ErrorCode::InputMouseMoved
+            | ErrorCode::InputMouseBusy
+    ) {
+        return base.into();
+    }
     match &error.detail {
         Some(detail) => format!("{base}\n{detail}"),
         None => base.into(),
@@ -5014,6 +5023,7 @@ mod tests {
         assert_eq!(text(app.control(KEY_PROFILE)), "Draft name");
         assert_eq!(text(app.control(KEY_STICK_RADIUS)), "140");
         assert_ne!(unsafe { IsWindowEnabled(app.control(KEY_PROFILE_NEW)) }, 0);
+        assert!(!app.saved_error, "{}", app.message);
         let (loaded, _) = Settings::load(&app.path).unwrap();
         assert_eq!(loaded.key_clicks, app.settings.key_clicks);
         select_key_combo(app, KEY_PROFILE, 0);
@@ -5169,9 +5179,11 @@ mod tests {
                 ],
             ),
         ] {
-            let error: ClickerError = code.into();
+            let error = ClickerError::with_detail(code, "backend-only warning detail");
             let japanese = error_text(&error, true);
             let english = error_text(&error, false);
+            assert!(!japanese.contains("backend-only"));
+            assert!(!english.contains("backend-only"));
             for term in japanese_terms {
                 assert!(japanese.contains(term), "{japanese}");
             }
