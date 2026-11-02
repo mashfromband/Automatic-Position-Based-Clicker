@@ -8,7 +8,7 @@ use std::{
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, SyncSender},
+        mpsc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -17,11 +17,16 @@ use windows_sys::Win32::{
     Foundation::*,
     Graphics::{
         Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
-        Gdi::{ClientToScreen, ScreenToClient},
+        Gdi::{ClientToScreen, MONITOR_DEFAULTTONULL, MonitorFromPoint, ScreenToClient},
     },
     System::{LibraryLoader::GetModuleHandleW, Threading::*},
     UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
+
+mod controls;
+mod injection;
+use controls::{ActiveSettings, RouteContext, SourceKeyState};
+use injection::{NativeSink, PhysicalMouse, Pixel, Runtime, Sink};
 
 fn error(code: ErrorCode) -> ClickerError {
     ClickerError::with_detail(code, std::io::Error::last_os_error().to_string())
@@ -203,6 +208,9 @@ impl Target {
         if unsafe { ClientToScreen(self.window as HWND, &mut screen) } == 0 {
             return Err(error(ErrorCode::KeyTarget));
         }
+        if unsafe { MonitorFromPoint(screen, MONITOR_DEFAULTTONULL) }.is_null() {
+            return Err(ErrorCode::PointOutside.into());
+        }
         if !self.foreground() || window_at(screen) != Some(self.window as HWND) {
             return Err(ErrorCode::KeyTarget.into());
         }
@@ -210,117 +218,225 @@ impl Target {
     }
 }
 
-#[derive(Default)]
 struct Snapshot {
     target: Option<Arc<Target>>,
-    bindings: Vec<KeyBinding>,
-    source_bindings: Vec<KeyBinding>,
+    source: ActiveSettings,
+    settings: ActiveSettings,
     size: Option<(i32, i32)>,
 }
-struct Request {
-    snapshot: Arc<Snapshot>,
-    generation: u64,
-    index: usize,
-    created: Instant,
+impl Default for Snapshot {
+    fn default() -> Self {
+        let settings = ActiveSettings::from(&KeyClickSettings::default());
+        Self {
+            target: None,
+            source: settings.clone(),
+            settings,
+            size: None,
+        }
+    }
 }
-struct Shared {
+struct Shared<S: Sink = NativeSink> {
     snapshot: RwLock<Arc<Snapshot>>,
+    source: Mutex<SourceKeyState>,
     active: AtomicBool,
     desired: AtomicBool,
     stopping: AtomicBool,
     generation: AtomicU64,
     clicks: AtomicU64,
     error: Mutex<Option<ClickerError>>,
-    output: Mutex<()>,
+    warning: Mutex<Option<ClickerError>>,
+    output: Mutex<Runtime<S>>,
+    wake: Mutex<Option<thread::Thread>>,
+    physical: Arc<Mutex<PhysicalMouse>>,
 }
-impl Shared {
-    fn valid(&self, request: &Request) -> bool {
+impl<S: Sink> Shared<S> {
+    fn new(sink: S, physical: Arc<Mutex<PhysicalMouse>>) -> Self {
+        Self {
+            snapshot: RwLock::new(Arc::new(Snapshot::default())),
+            source: Mutex::new(SourceKeyState::default()),
+            active: AtomicBool::new(false),
+            desired: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            clicks: AtomicU64::new(0),
+            error: Mutex::new(None),
+            warning: Mutex::new(None),
+            output: Mutex::new(Runtime::new(sink)),
+            wake: Mutex::new(None),
+            physical,
+        }
+    }
+    fn notify(&self) {
+        if let Some(worker) = self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            worker.unpark();
+        }
+    }
+    fn report(&self, error: ClickerError) {
+        *self
+            .error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+    }
+    fn current(&self, generation: u64, snapshot: &Arc<Snapshot>) -> bool {
         self.active.load(Ordering::Acquire)
             && self.desired.load(Ordering::Acquire)
             && !self.stopping.load(Ordering::Acquire)
-            && self.generation.load(Ordering::Acquire) == request.generation
+            && self.generation.load(Ordering::Acquire) == generation
             && self
                 .snapshot
                 .read()
-                .is_ok_and(|snapshot| Arc::ptr_eq(&snapshot, &request.snapshot))
+                .is_ok_and(|current| Arc::ptr_eq(&current, snapshot))
     }
-    fn current(&self, request: &Request) -> bool {
-        self.valid(request) && request.created.elapsed() <= Duration::from_millis(250)
-    }
-    fn report(&self, error: ClickerError) {
-        if let Ok(mut slot) = self.error.lock() {
-            *slot = Some(error);
+    fn drain(&self) -> bool {
+        let mut output = self
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let source = self
+            .source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot();
+        let result = output.halt(&source);
+        if let Some(warning) = output.warning.take() {
+            *self
+                .warning
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(warning);
+        }
+        if let Err(error) = result {
+            self.report(error);
+            false
+        } else {
+            true
         }
     }
-    fn pause(&self) {
+    fn pause(&self) -> bool {
         self.active.store(false, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
-        drop(
-            self.output
+        self.source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .suspend();
+        self.notify();
+        // Shares the worker's output lock and releases its ownership journal.
+        // Returning from pause therefore also drains an in-flight DOWN/pulse.
+        self.drain()
+    }
+    fn process(
+        &self,
+        snapshot: &Arc<Snapshot>,
+        now: Instant,
+        foreground: impl Fn() -> bool,
+        resolve: impl FnMut(&ClientPoint) -> Result<Pixel, ClickerError>,
+    ) {
+        let generation = self.generation.load(Ordering::Acquire);
+        let mut output = self
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.current(generation, snapshot)
+            && self.active.load(Ordering::Acquire)
+            && self.desired.load(Ordering::Acquire)
+            && !self.stopping.load(Ordering::Acquire)
+        {
+            // A frame captured before reconfiguration must not disarm input
+            // already accepted by the newly armed mapping.
+            return;
+        }
+        let before = output.completed;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let ready = self.current(generation, snapshot) && foreground();
+            let mut source = self
+                .source
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !ready {
+                source.suspend();
+            }
+            let state = source.snapshot();
+            drop(source);
+            output.frame(&snapshot.settings, &state, now, resolve, || {
+                let context_ready = self.current(generation, snapshot) && foreground();
+                let mut source = self
+                    .source
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let allowed = context_ready && !source.shortcut_active();
+                if !allowed {
+                    source.suspend();
+                }
+                allowed
+            })
+        }))
+        .unwrap_or_else(|_| Err(ErrorCode::WorkerPanic.into()));
+        self.clicks
+            .fetch_add(output.completed - before, Ordering::Relaxed);
+        if let Some(warning) = output.warning.take() {
+            *self
+                .warning
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(warning);
+        }
+        if let Err(error) = result {
+            self.active.store(false, Ordering::Release);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            let mut source = self
+                .source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            source.suspend();
+            let state = source.snapshot();
+            drop(source);
+            let _ = output.halt(&state);
+            self.report(error);
+        }
     }
 }
 struct Context {
     shared: Arc<Shared>,
-    sender: SyncSender<Request>,
-    keys: KeyState,
 }
-fn dispatch(
-    shared: &Shared,
-    request: &Request,
-    resolve: impl FnOnce() -> Result<Option<(i32, i32, bool)>, ClickerError>,
-    emit: impl FnOnce(i32, i32, bool) -> Result<bool, ClickerError>,
-) -> Result<bool, ClickerError> {
-    match catch_unwind(AssertUnwindSafe(|| {
-        dispatch_inner(shared, request, resolve, emit)
-    })) {
-        Ok(result) => result,
-        Err(_) => {
-            shared.active.store(false, Ordering::Release);
-            shared.desired.store(false, Ordering::Release);
-            shared.generation.fetch_add(1, Ordering::AcqRel);
-            Err(ErrorCode::WorkerPanic.into())
+thread_local! { static CONTEXT: RefCell<Option<Context>> = const { RefCell::new(None) }; }
+
+struct Hooks {
+    keyboard: HHOOK,
+    mouse: HHOOK,
+    shared: Arc<Shared>,
+}
+impl Drop for Hooks {
+    fn drop(&mut self) {
+        self.shared.active.store(false, Ordering::Release);
+        self.shared.stopping.store(true, Ordering::Release);
+        self.shared.generation.fetch_add(1, Ordering::AcqRel);
+        self.shared
+            .source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .suspend();
+        unsafe {
+            if !self.mouse.is_null() {
+                UnhookWindowsHookEx(self.mouse);
+            }
+            if !self.keyboard.is_null() {
+                UnhookWindowsHookEx(self.keyboard);
+            }
         }
+        let _ = CONTEXT.try_with(|slot| {
+            if let Ok(mut slot) = slot.try_borrow_mut() {
+                slot.take();
+            }
+        });
+        // Never join/drain from the hook thread: SendInput may still be waiting
+        // for that thread's callback. Unhook first, then wake the output owner.
+        self.shared.notify();
     }
 }
-fn dispatch_inner(
-    shared: &Shared,
-    request: &Request,
-    resolve: impl FnOnce() -> Result<Option<(i32, i32, bool)>, ClickerError>,
-    emit: impl FnOnce(i32, i32, bool) -> Result<bool, ClickerError>,
-) -> Result<bool, ClickerError> {
-    if !shared.current(request) {
-        return Ok(false);
-    }
-    let _output = shared
-        .output
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !shared.current(request) {
-        return Ok(false);
-    }
-    let Some((x, y, right)) = resolve()? else {
-        return Ok(false);
-    };
-    if !shared.current(request) {
-        return Ok(false);
-    }
-    let clicked = emit(x, y, right)?;
-    if clicked {
-        shared.clicks.fetch_add(1, Ordering::Relaxed);
-    }
-    Ok(clicked)
-}
-fn allowed_during_pulse(
-    shared: &Shared,
-    request: &Request,
-    foreground: impl FnOnce() -> bool,
-) -> bool {
-    shared.valid(request) && foreground()
-}
-thread_local! {static CONTEXT:RefCell<Option<Context>>=const {RefCell::new(None)};}
+
 unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0
         && matches!(
@@ -329,53 +445,91 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
         )
     {
         let event = unsafe { &*(lp as *const KBDLLHOOKSTRUCT) };
-        let suppress = CONTEXT.with(|slot| {
-            let Ok(mut slot) = slot.try_borrow_mut() else {
-                return false;
-            };
-            let Some(context) = slot.as_mut() else {
-                return false;
-            };
-            let shared = &context.shared;
-            let generation = shared.generation.load(Ordering::Acquire);
-            let snapshot = shared.snapshot.try_read().ok().map(|s| s.clone());
-            let ready = shared.active.load(Ordering::Acquire)
-                && shared.desired.load(Ordering::Acquire)
-                && !shared.stopping.load(Ordering::Acquire);
-            let binding = snapshot.as_ref().filter(|_| ready).and_then(|s| {
-                s.target.as_ref().filter(|t| t.foreground()).and_then(|_| {
-                    s.bindings
-                        .iter()
-                        .position(|b| b.key == Some(event.vkCode) && b.position.is_some())
-                })
-            });
-            let modifiers = [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
-                .into_iter()
-                .any(|key| unsafe { GetAsyncKeyState(key as i32) } < 0);
-            let decision = context.keys.event(
-                event.vkCode,
-                matches!(wp as u32, WM_KEYDOWN | WM_SYSKEYDOWN),
-                event.flags & LLKHF_INJECTED != 0,
-                binding,
-                modifiers,
-            );
-            if let Some(index) = decision.click {
-                if let Some(snapshot) = snapshot {
-                    let request = Request {
-                        snapshot,
-                        generation,
-                        index,
-                        created: Instant::now(),
-                    };
-                    if context.sender.try_send(request).is_err() {
-                        shared.report(ErrorCode::InputSend.into());
+        if event.flags & LLKHF_INJECTED == 0 {
+            let suppress = CONTEXT.with(|slot| {
+                let Ok(slot) = slot.try_borrow() else {
+                    return false;
+                };
+                let Some(context) = slot.as_ref() else {
+                    return false;
+                };
+                let shared = &context.shared;
+                match catch_unwind(AssertUnwindSafe(|| {
+                    let snapshot = shared
+                        .snapshot
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    let ready = shared.active.load(Ordering::Acquire)
+                        && shared.desired.load(Ordering::Acquire)
+                        && !shared.stopping.load(Ordering::Acquire)
+                        && snapshot
+                            .target
+                            .as_ref()
+                            .is_some_and(|target| target.foreground());
+                    let mut source = shared
+                        .source
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let suppress = source.route(
+                        &snapshot.settings,
+                        event.vkCode,
+                        matches!(wp as u32, WM_KEYDOWN | WM_SYSKEYDOWN),
+                        false,
+                        RouteContext {
+                            ready,
+                            alt: event.flags & LLKHF_ALTDOWN != 0,
+                        },
+                        Instant::now(),
+                    );
+                    drop(source);
+                    shared.notify();
+                    suppress
+                })) {
+                    Ok(suppress) => suppress,
+                    Err(_) => {
+                        shared.active.store(false, Ordering::Release);
+                        shared.generation.fetch_add(1, Ordering::AcqRel);
+                        shared.report(ErrorCode::WorkerPanic.into());
+                        shared.notify();
+                        false
                     }
                 }
+            });
+            if suppress {
+                return 1;
             }
-            decision.suppress
-        });
-        if suppress {
-            return 1;
+        }
+    }
+    unsafe { CallNextHookEx(null_mut(), code, wp, lp) }
+}
+unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code >= 0 {
+        let event = unsafe { &*(lp as *const MSLLHOOKSTRUCT) };
+        // Promoted touch input is not a physical takeover of Mouse mode.
+        let from_touch = event.dwExtraInfo & 0xffff_ff00 == 0xff51_5700;
+        if !from_touch && event.dwExtraInfo != crate::engine::KEY_CLICK_TAG {
+            CONTEXT.with(|slot| {
+                if let Ok(slot) = slot.try_borrow() {
+                    if let Some(context) = slot.as_ref() {
+                        let mut physical = context
+                            .shared
+                            .physical
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        physical.activity = physical.activity.wrapping_add(1);
+                        match wp as u32 {
+                            WM_LBUTTONDOWN => physical.left = true,
+                            WM_LBUTTONUP => physical.left = false,
+                            WM_RBUTTONDOWN => physical.right = true,
+                            WM_RBUTTONUP => physical.right = false,
+                            _ => {}
+                        }
+                        drop(physical);
+                        context.shared.notify();
+                    }
+                }
+            });
         }
     }
     unsafe { CallNextHookEx(null_mut(), code, wp, lp) }
@@ -383,127 +537,153 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
 
 pub struct Controller {
     shared: Arc<Shared>,
-    sender: Option<SyncSender<Request>>,
     hook: Option<JoinHandle<()>>,
     worker: Option<JoinHandle<()>>,
     hook_id: u32,
 }
 impl Controller {
     pub fn start() -> Result<Self, ClickerError> {
-        let shared = Arc::new(Shared {
-            snapshot: RwLock::new(Arc::new(Snapshot::default())),
-            active: AtomicBool::new(false),
-            desired: AtomicBool::new(false),
-            stopping: AtomicBool::new(false),
-            generation: AtomicU64::new(0),
-            clicks: AtomicU64::new(0),
-            error: Mutex::new(None),
-            output: Mutex::new(()),
-        });
-        let (sender, receiver) = mpsc::sync_channel::<Request>(8);
+        let physical = Arc::new(Mutex::new(PhysicalMouse::default()));
+        let shared = Arc::new(Shared::new(NativeSink::new(physical.clone()), physical));
         let worker_shared = shared.clone();
         let worker = thread::Builder::new()
             .name("key-click-input".into())
             .spawn(move || {
-                while let Ok(request) = receiver.recv() {
-                    let result = dispatch(
-                        &worker_shared,
-                        &request,
-                        || {
-                            let Some(target) = &request.snapshot.target else {
-                                return Ok(None);
-                            };
-                            let Some(binding) = request.snapshot.bindings.get(request.index) else {
-                                return Ok(None);
-                            };
-                            let Some(point) = &binding.position else {
-                                return Ok(None);
-                            };
-                            let screen = target.screen_point(point)?;
-                            Ok(Some((screen.x, screen.y, binding.right)))
-                        },
-                        |x, y, right| {
-                            if !request
-                                .snapshot
-                                .target
-                                .as_ref()
-                                .is_some_and(|target| target.foreground())
-                            {
-                                return Ok(false);
-                            }
-                            crate::engine::click_once_restore(x, y, right, || {
-                                allowed_during_pulse(&worker_shared, &request, || {
-                                    request
-                                        .snapshot
-                                        .target
-                                        .as_ref()
-                                        .is_some_and(|target| target.foreground())
-                                })
-                            })
-                        },
-                    );
-                    if let Err(error) = result {
-                        worker_shared.report(error);
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    while !worker_shared.stopping.load(Ordering::Acquire) {
+                        let snapshot = worker_shared
+                            .snapshot
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
+                        worker_shared.process(
+                            &snapshot,
+                            Instant::now(),
+                            || {
+                                snapshot
+                                    .target
+                                    .as_ref()
+                                    .is_some_and(|target| target.foreground())
+                            },
+                            |point| {
+                                snapshot
+                                    .target
+                                    .as_ref()
+                                    .ok_or_else(|| ClickerError::from(ErrorCode::KeyTarget))?
+                                    .screen_point(point)
+                                    .map(Pixel::from)
+                            },
+                        );
+                        thread::park_timeout(Duration::from_millis(8));
                     }
+                }));
+                if result.is_err() {
+                    worker_shared.active.store(false, Ordering::Release);
+                    worker_shared.report(ErrorCode::WorkerPanic.into());
                 }
+                worker_shared.drain();
             })
-            .map_err(|e| ClickerError::with_detail(ErrorCode::ThreadStart, e.to_string()))?;
+            .map_err(|error| {
+                ClickerError::with_detail(ErrorCode::ThreadStart, error.to_string())
+            })?;
+        *shared
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(worker.thread().clone());
         let hook_shared = shared.clone();
-        let hook_sender = sender.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let hook_result = thread::Builder::new()
             .name("key-click-keyboard".into())
-            .spawn(move || unsafe {
-                let mut message: MSG = zeroed();
-                PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE);
-                let mut keys = KeyState::default();
-                keys.seed_down((0..256).filter(|key| GetAsyncKeyState(*key as i32) < 0));
-                CONTEXT.with(|slot| {
-                    *slot.borrow_mut() = Some(Context {
-                        shared: hook_shared.clone(),
-                        sender: hook_sender,
-                        keys,
-                    })
-                });
-                let hook =
-                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard), GetModuleHandleW(null()), 0);
-                if hook.is_null() {
-                    let _ = ready_tx.send(Err(error(ErrorCode::InputMonitor)));
-                    CONTEXT.with(|slot| slot.borrow_mut().take());
-                    return;
-                }
-                let _ = ready_tx.send(Ok(GetCurrentThreadId()));
-                while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
-                    if message.message == RESEED {
-                        CONTEXT.with(|slot| {
-                            if let Some(context) = slot.borrow_mut().as_mut() {
-                                context.keys.seed_down(
-                                    (0..256).filter(|key| GetAsyncKeyState(*key as i32) < 0),
-                                );
-                            }
-                        });
-                        if message.wParam as u64 == hook_shared.generation.load(Ordering::Acquire)
-                            && hook_shared.desired.load(Ordering::Acquire)
-                            && !hook_shared.stopping.load(Ordering::Acquire)
-                        {
-                            hook_shared.active.store(true, Ordering::Release);
-                        }
-                        continue;
+            .spawn(move || {
+                let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+                    let mut message: MSG = zeroed();
+                    PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE);
+                    hook_shared
+                        .source
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .seed_down((0..256).filter(|key| GetAsyncKeyState(*key as i32) < 0));
+                    {
+                        let mut physical = hook_shared
+                            .physical
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        physical.left = GetAsyncKeyState(VK_LBUTTON as i32) < 0;
+                        physical.right = GetAsyncKeyState(VK_RBUTTON as i32) < 0;
                     }
-                    TranslateMessage(&message);
-                    DispatchMessageW(&message);
+                    CONTEXT.with(|slot| {
+                        *slot.borrow_mut() = Some(Context {
+                            shared: hook_shared.clone(),
+                        })
+                    });
+                    let keyboard_hook = SetWindowsHookExW(
+                        WH_KEYBOARD_LL,
+                        Some(keyboard),
+                        GetModuleHandleW(null()),
+                        0,
+                    );
+                    let mut hooks = Hooks {
+                        keyboard: keyboard_hook,
+                        mouse: null_mut(),
+                        shared: hook_shared.clone(),
+                    };
+                    hooks.mouse = if keyboard_hook.is_null() {
+                        null_mut()
+                    } else {
+                        SetWindowsHookExW(WH_MOUSE_LL, Some(mouse), GetModuleHandleW(null()), 0)
+                    };
+                    if keyboard_hook.is_null() || hooks.mouse.is_null() {
+                        let failure = error(ErrorCode::InputMonitor);
+                        let _ = ready_tx.send(Err(failure));
+                        return;
+                    }
+                    let _ = ready_tx.send(Ok(GetCurrentThreadId()));
+                    loop {
+                        let result = GetMessageW(&mut message, null_mut(), 0, 0);
+                        if result <= 0 {
+                            if result < 0 {
+                                hook_shared.report(error(ErrorCode::InputMonitor));
+                            }
+                            break;
+                        }
+                        if message.message == RESEED {
+                            if message.wParam as u64
+                                == hook_shared.generation.load(Ordering::Acquire)
+                                && hook_shared.desired.load(Ordering::Acquire)
+                                && !hook_shared.stopping.load(Ordering::Acquire)
+                            {
+                                hook_shared
+                                    .source
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .seed_down(
+                                        (0..256).filter(|key| GetAsyncKeyState(*key as i32) < 0),
+                                    );
+                                hook_shared.active.store(true, Ordering::Release);
+                                hook_shared.notify();
+                            }
+                            continue;
+                        }
+                        TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                }));
+                if result.is_err() {
+                    hook_shared.active.store(false, Ordering::Release);
+                    hook_shared.stopping.store(true, Ordering::Release);
+                    hook_shared.report(ErrorCode::WorkerPanic.into());
+                    hook_shared.notify();
                 }
-                UnhookWindowsHookEx(hook);
-                CONTEXT.with(|slot| slot.borrow_mut().take());
             });
         let hook = match hook_result {
             Ok(hook) => hook,
-            Err(e) => {
-                drop(sender);
+            Err(error) => {
+                shared.stopping.store(true, Ordering::Release);
+                shared.notify();
                 let _ = worker.join();
                 return Err(ClickerError::with_detail(
                     ErrorCode::ThreadStart,
-                    e.to_string(),
+                    error.to_string(),
                 ));
             }
         };
@@ -511,26 +691,47 @@ impl Controller {
             Ok(Ok(id)) => id,
             result => {
                 let _ = hook.join();
-                drop(sender);
+                shared.stopping.store(true, Ordering::Release);
+                shared.notify();
                 let _ = worker.join();
                 return Err(result
                     .ok()
                     .and_then(Result::err)
+                    .or_else(|| {
+                        shared
+                            .error
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                    })
                     .unwrap_or_else(|| ErrorCode::InputMonitor.into()));
             }
         };
         Ok(Self {
             shared,
-            sender: Some(sender),
             hook: Some(hook),
             worker: Some(worker),
             hook_id,
         })
     }
+    fn reseed(&self) {
+        if unsafe {
+            PostThreadMessageW(
+                self.hook_id,
+                RESEED,
+                self.shared.generation.load(Ordering::Acquire) as usize,
+                0,
+            )
+        } == 0
+        {
+            self.shared.report(error(ErrorCode::InputMonitor));
+        }
+    }
     pub fn configure(&mut self, target: Option<Arc<Target>>, settings: &KeyClickSettings) {
         let size = target.as_ref().and_then(|target| target.client_size().ok());
+        let source = ActiveSettings::from(settings);
         if self.shared.snapshot.read().is_ok_and(|old| {
-            old.source_bindings == settings.bindings
+            old.source == source
                 && old.size == size
                 && match (&old.target, &target) {
                     (None, None) => true,
@@ -541,55 +742,88 @@ impl Controller {
             return;
         }
         let desired = self.shared.desired.swap(false, Ordering::AcqRel);
-        self.shared.pause();
-        let mut bindings = settings.bindings.clone();
-        for binding in &mut bindings {
-            if !binding.position.as_ref().is_some_and(|point| {
-                target
-                    .as_ref()
-                    .zip(size)
-                    .is_some_and(|(target, (width, height))| {
-                        point.fits(&target.identity, width, height)
-                    })
-            }) {
+        let drained = self.shared.pause();
+        let mut active = source.clone();
+        let fits = |point: &ClientPoint| {
+            target
+                .as_ref()
+                .zip(size)
+                .is_some_and(|(target, (width, height))| {
+                    point.fits(&target.identity, width, height)
+                })
+        };
+        for binding in &mut active.bindings {
+            if !binding.position.as_ref().is_some_and(fits) {
                 binding.position = None;
             }
         }
-        if let Ok(mut snapshot) = self.shared.snapshot.write() {
-            *snapshot = Arc::new(Snapshot {
-                target,
-                bindings,
-                source_bindings: settings.bindings.clone(),
-                size,
-            });
+        let stick_valid = active.stick.center.as_ref().is_some_and(|center| {
+            let radius = i64::from(active.stick.radius_px);
+            fits(center)
+                && (4..=2048).contains(&active.stick.radius_px)
+                && i64::from(center.x) - radius >= 0
+                && i64::from(center.y) - radius >= 0
+                && i64::from(center.x) + radius < i64::from(center.width)
+                && i64::from(center.y) + radius < i64::from(center.height)
+        });
+        if !stick_valid {
+            active.stick.center = None;
         }
-        self.shared.generation.fetch_add(1, Ordering::AcqRel);
+        let warning = if active.input_method == InputMethod::Touch
+            && active
+                .bindings
+                .iter()
+                .any(|binding| binding.right && binding.position.is_some())
+        {
+            Some(ClickerError::with_detail(
+                ErrorCode::InputCombination,
+                "Touch cannot send right-button actions; select Mouse for this setting.",
+            ))
+        } else {
+            None
+        };
+        *self
+            .shared
+            .warning
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = warning;
+        if drained {
+            *self
+                .shared
+                .error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = if source.movement_mode
+                == MovementMode::Stick
+                && source.stick.center.is_some()
+                && !stick_valid
+            {
+                Some(ErrorCode::StickRange.into())
+            } else {
+                None
+            };
+        }
+        *self
+            .shared
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(Snapshot {
+            target,
+            source,
+            settings: active,
+            size,
+        });
         self.shared.desired.store(desired, Ordering::Release);
-        if let Ok(mut error) = self.shared.error.lock() {
-            *error = None;
-        }
-        if self.shared.desired.load(Ordering::Acquire) {
-            unsafe {
-                PostThreadMessageW(
-                    self.hook_id,
-                    RESEED,
-                    self.shared.generation.load(Ordering::Acquire) as usize,
-                    0,
-                );
-            }
+        if desired && drained {
+            self.reseed();
         }
     }
     pub fn set_active(&self, active: bool) {
+        if self.shared.stopping.load(Ordering::Acquire) {
+            return;
+        }
         if self.shared.desired.swap(active, Ordering::AcqRel) != active {
             if active {
-                unsafe {
-                    PostThreadMessageW(
-                        self.hook_id,
-                        RESEED,
-                        self.shared.generation.load(Ordering::Acquire) as usize,
-                        0,
-                    );
-                }
+                self.reseed();
             } else {
                 self.shared.pause();
             }
@@ -599,21 +833,38 @@ impl Controller {
         self.shared.clicks.load(Ordering::Relaxed)
     }
     pub fn take_error(&self) -> Option<ClickerError> {
-        self.shared.error.lock().ok().and_then(|mut e| e.take())
+        self.shared
+            .error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+    pub fn warning(&self) -> Option<ClickerError> {
+        self.shared
+            .warning
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
     pub fn stop(&mut self) {
-        self.set_active(false);
+        self.shared.desired.store(false, Ordering::Release);
         self.shared.stopping.store(true, Ordering::Release);
+        self.shared.pause();
         if let Some(hook) = self.hook.take() {
-            unsafe {
-                PostThreadMessageW(self.hook_id, WM_QUIT, 0, 0);
+            if unsafe { PostThreadMessageW(self.hook_id, WM_QUIT, 0, 0) } == 0 {
+                self.shared.report(error(ErrorCode::InputMonitor));
             }
-            let _ = hook.join();
+            if hook.join().is_err() {
+                self.shared.report(ErrorCode::WorkerPanic.into());
+            }
         }
-        self.sender.take();
+        self.shared.notify();
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            if worker.join().is_err() {
+                self.shared.report(ErrorCode::WorkerPanic.into());
+            }
         }
+        self.shared.drain();
     }
 }
 impl Drop for Controller {
@@ -623,119 +874,4 @@ impl Drop for Controller {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn dispatch_clicks_only_the_current_enabled_request_and_resolved_input() {
-        let snapshot = Arc::new(Snapshot::default());
-        let shared = Shared {
-            snapshot: RwLock::new(snapshot.clone()),
-            active: AtomicBool::new(true),
-            desired: AtomicBool::new(true),
-            stopping: AtomicBool::new(false),
-            generation: AtomicU64::new(1),
-            clicks: AtomicU64::new(0),
-            error: Mutex::new(None),
-            output: Mutex::new(()),
-        };
-        let request = Request {
-            snapshot: snapshot.clone(),
-            generation: 1,
-            index: 0,
-            created: Instant::now(),
-        };
-        let emitted = Mutex::new(Vec::new());
-        let send = |x, y, right| {
-            emitted.lock().unwrap().push((x, y, right));
-            Ok(true)
-        };
-        assert!(dispatch(&shared, &request, || Ok(Some((120, 230, false))), send).unwrap());
-        assert!(!dispatch(&shared, &request, || Ok(None), send).unwrap());
-        shared.desired.store(false, Ordering::Release);
-        shared.pause();
-        assert!(
-            !dispatch(
-                &shared,
-                &request,
-                || panic!("stopped request reached resolver"),
-                send
-            )
-            .unwrap()
-        );
-        shared.desired.store(true, Ordering::Release);
-        shared.active.store(true, Ordering::Release);
-        assert!(
-            !dispatch(
-                &shared,
-                &request,
-                || panic!("stale generation reached resolver"),
-                send
-            )
-            .unwrap()
-        );
-        *shared.snapshot.write().unwrap() = Arc::new(Snapshot::default());
-        let stale = Request {
-            snapshot,
-            generation: shared.generation.load(Ordering::Acquire),
-            index: 0,
-            created: Instant::now(),
-        };
-        assert!(
-            !dispatch(
-                &shared,
-                &stale,
-                || panic!("obsolete mapping reached resolver"),
-                send
-            )
-            .unwrap()
-        );
-        let current = Request {
-            snapshot: shared.snapshot.read().unwrap().clone(),
-            generation: shared.generation.load(Ordering::Acquire),
-            index: 0,
-            created: Instant::now(),
-        };
-        let expired = Request {
-            snapshot: current.snapshot.clone(),
-            generation: current.generation,
-            index: 0,
-            created: Instant::now() - Duration::from_secs(1),
-        };
-        assert!(
-            !dispatch(
-                &shared,
-                &expired,
-                || panic!("expired request reached resolver"),
-                send
-            )
-            .unwrap()
-        );
-        // Once a pulse starts, aging alone must not cut its 50ms hold short.
-        assert!(allowed_during_pulse(&shared, &expired, || true));
-        assert!(!allowed_during_pulse(&shared, &expired, || false));
-        assert!(dispatch(&shared, &current, || Ok(Some((340, 450, true))), send).unwrap());
-        let panic = dispatch(
-            &shared,
-            &current,
-            || panic!("resolver failure fixture"),
-            send,
-        )
-        .unwrap_err();
-        assert_eq!(panic.code, ErrorCode::WorkerPanic);
-        assert!(!shared.active.load(Ordering::Acquire));
-        shared.active.store(true, Ordering::Release);
-        shared.desired.store(true, Ordering::Release);
-        let resumed = Request {
-            snapshot: current.snapshot.clone(),
-            generation: shared.generation.load(Ordering::Acquire),
-            index: 0,
-            created: Instant::now(),
-        };
-        assert!(dispatch(&shared, &resumed, || Ok(Some((560, 670, false))), send).unwrap());
-        assert_eq!(
-            *emitted.lock().unwrap(),
-            [(120, 230, false), (340, 450, true), (560, 670, false)]
-        );
-        assert_eq!(shared.clicks.load(Ordering::Relaxed), 3);
-    }
-}
+mod tests;

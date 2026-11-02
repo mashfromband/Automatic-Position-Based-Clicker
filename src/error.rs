@@ -4,6 +4,11 @@ use serde::Serialize;
 pub enum ErrorCode {
     KeyMapping,
     KeyTarget,
+    StickRange,
+    ProfileName,
+    ProfileLimit,
+    InputCombination,
+    InputInitialize,
     AreaMissing,
     AreaInvalid,
     InputMonitor,
