@@ -1,13 +1,11 @@
 //! App-lifetime reservations for Windows' Alt+Shift input-language shortcut.
 use std::{io, marker::PhantomData, ptr::null_mut, rc::Rc};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_ALT, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey, UnregisterHotKey, VK_MENU, VK_SHIFT,
+    MOD_ALT, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey, UnregisterHotKey,
 };
 
-const HOTKEYS: [(i32, u32, u32); 2] = [
-    (0x4d10, MOD_ALT | MOD_NOREPEAT, VK_SHIFT as u32),
-    (0x4d11, MOD_SHIFT | MOD_NOREPEAT, VK_MENU as u32),
-];
+// Both keys are modifiers; there is no non-modifier primary key.
+const LANGUAGE_HOTKEY: (i32, u32, u32) = (0x4d10, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 0);
 struct Hotkey {
     id: i32,
     _thread: PhantomData<Rc<()>>,
@@ -32,18 +30,18 @@ impl Drop for Hotkey {
 }
 /// Owned by the UI thread throughout the message loop, including when idle.
 /// Windows owns these registrations and releases them when their thread exits.
-/// No saved language preference or keyboard/mouse input is modified.
+/// No saved language preference is changed and no input is synthesized.
 pub struct InputLanguageGuard {
-    hotkeys: [Hotkey; 2],
+    hotkey: Hotkey,
 }
 impl InputLanguageGuard {
     pub fn register() -> io::Result<Self> {
         Ok(Self {
-            hotkeys: [Hotkey::register(HOTKEYS[0])?, Hotkey::register(HOTKEYS[1])?],
+            hotkey: Hotkey::register(LANGUAGE_HOTKEY)?,
         })
     }
     pub fn owns_hotkey(&self, id: usize) -> bool {
-        self.hotkeys.iter().any(|hotkey| hotkey.id as usize == id)
+        self.hotkey.id as usize == id
     }
 }
 #[cfg(test)]
@@ -148,9 +146,9 @@ mod tests {
             .join()
             .unwrap()
         }
-        fn probe(&self, index: usize) -> Result<(), Option<i32>> {
+        fn probe(&self) -> Result<(), Option<i32>> {
             self.on_other_thread(move || {
-                Hotkey::register(HOTKEYS[index])
+                Hotkey::register(LANGUAGE_HOTKEY)
                     .map(|_| ())
                     .map_err(|error| error.raw_os_error())
             })
@@ -178,21 +176,16 @@ mod tests {
         isolated(|| {
             let desktop = Desktop::new();
             let guard = InputLanguageGuard::register().unwrap();
-            for index in 0..2 {
-                assert_eq!(
-                    desktop.probe(index),
-                    Err(Some(ERROR_HOTKEY_ALREADY_REGISTERED as i32))
-                );
-            }
-            assert!(guard.owns_hotkey(HOTKEYS[0].0 as usize));
-            assert!(guard.owns_hotkey(HOTKEYS[1].0 as usize));
+            assert_eq!(
+                desktop.probe(),
+                Err(Some(ERROR_HOTKEY_ALREADY_REGISTERED as i32))
+            );
+            assert!(guard.owns_hotkey(LANGUAGE_HOTKEY.0 as usize));
             for id in [0, 1, 2, 3, 4, 5, usize::MAX] {
                 assert!(!guard.owns_hotkey(id));
             }
             drop(guard);
-            for index in 0..2 {
-                assert_eq!(desktop.probe(index), Ok(()));
-            }
+            assert_eq!(desktop.probe(), Ok(()));
         });
     }
     #[test]
@@ -212,7 +205,7 @@ mod tests {
         });
     }
     #[test]
-    fn partial_registration_failure_restores_the_first_reservation() {
+    fn registration_conflict_preserves_the_existing_owner() {
         isolated(|| {
             let desktop = Desktop::new();
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -220,7 +213,7 @@ mod tests {
             let other_desktop = desktop.current as usize;
             let worker = thread::spawn(move || {
                 assert_ne!(unsafe { SetThreadDesktop(other_desktop as HDESK) }, 0);
-                let held = Hotkey::register(HOTKEYS[1]);
+                let held = Hotkey::register(LANGUAGE_HOTKEY);
                 let result = held
                     .as_ref()
                     .map(|_| ())
@@ -235,9 +228,8 @@ mod tests {
                     InputLanguageGuard::register().err().unwrap().raw_os_error(),
                     Some(ERROR_HOTKEY_ALREADY_REGISTERED as i32)
                 );
-                assert_eq!(desktop.probe(0), Ok(()));
                 assert_eq!(
-                    desktop.probe(1),
+                    desktop.probe(),
                     Err(Some(ERROR_HOTKEY_ALREADY_REGISTERED as i32))
                 );
             }));
@@ -246,7 +238,7 @@ mod tests {
             if let Err(panic) = result {
                 std::panic::resume_unwind(panic);
             }
-            assert_eq!(desktop.probe(1), Ok(()));
+            assert_eq!(desktop.probe(), Ok(()));
         });
     }
     #[test]
@@ -254,9 +246,7 @@ mod tests {
         isolated(|| {
             let desktop = Desktop::new();
             desktop.on_other_thread(|| std::mem::forget(InputLanguageGuard::register().unwrap()));
-            for index in 0..2 {
-                assert_eq!(desktop.probe(index), Ok(()));
-            }
+            assert_eq!(desktop.probe(), Ok(()));
         });
     }
 }
