@@ -144,7 +144,7 @@ pub fn default_hotkeys() -> BTreeMap<String, String> {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            version: 3,
+            version: 4,
             lang: "ja".into(),
             theme: "system".into(),
             points: vec![],
@@ -236,8 +236,11 @@ impl Settings {
         }
         let migrated = value.get("version").is_none();
         let rust_v2 = value.get("version").and_then(|v| v.as_u64()) == Some(2);
+        let rust_v3 = value.get("version").and_then(|v| v.as_u64()) == Some(3);
         if rust_v2 {
             upgrade_millisecond_settings(&mut value)?;
+        } else if rust_v3 {
+            value["version"] = serde_json::Value::from(4);
         }
         let mut settings = if migrated {
             let old: LegacySettings = serde_json::from_value(value)
@@ -266,7 +269,7 @@ impl Settings {
                 ..Self::default()
             }
         } else {
-            if value.get("version").and_then(|v| v.as_u64()) != Some(3) {
+            if value.get("version").and_then(|v| v.as_u64()) != Some(4) {
                 return Err(ErrorCode::SettingsVersion.into());
             }
             serde_json::from_value(value)
@@ -276,33 +279,15 @@ impl Settings {
             settings.hotkeys.entry(key).or_insert(value);
         }
         settings.validate()?;
-        if migrated || rust_v2 {
+        if migrated || rust_v2 || rust_v3 {
             let backup = path.with_file_name(if migrated {
                 "settings.python-backup.json"
-            } else {
+            } else if rust_v2 {
                 "settings.v2-backup.json"
+            } else {
+                "settings.v3-backup.json"
             });
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&backup)
-            {
-                Ok(mut file) => {
-                    use std::io::Write;
-                    file.write_all(&raw)
-                        .and_then(|_| file.sync_all())
-                        .map_err(|e| {
-                            ClickerError::with_detail(ErrorCode::SettingsBackup, e.to_string())
-                        })?;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => {
-                    return Err(ClickerError::with_detail(
-                        ErrorCode::SettingsBackup,
-                        e.to_string(),
-                    ));
-                }
-            }
+            preserve_settings_backup(&backup, &raw)?;
         }
         Ok((settings, migrated))
     }
@@ -328,25 +313,9 @@ impl Settings {
             drop(file);
             #[cfg(windows)]
             {
-                use std::os::windows::ffi::OsStrExt;
-                use windows_sys::Win32::Storage::FileSystem::{
-                    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-                };
-                let source: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
-                let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-                if unsafe {
-                    MoveFileExW(
-                        source.as_ptr(),
-                        destination.as_ptr(),
-                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                    )
-                } == 0
-                {
-                    return Err(ClickerError::with_detail(
-                        ErrorCode::SettingsWrite,
-                        std::io::Error::last_os_error().to_string(),
-                    ));
-                }
+                replace_settings_file(&temp, path, std::thread::sleep).map_err(|e| {
+                    ClickerError::with_detail(ErrorCode::SettingsWrite, e.to_string())
+                })?;
             }
             #[cfg(not(windows))]
             fs::rename(&temp, path)
@@ -357,6 +326,109 @@ impl Settings {
             let _ = fs::remove_file(&temp);
         }
         result
+    }
+}
+
+#[cfg(windows)]
+fn replace_settings_file(
+    temp: &Path,
+    path: &Path,
+    mut retry_wait: impl FnMut(std::time::Duration),
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::{ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION},
+        Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
+    };
+    let source: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    for attempt in 0..8 {
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } != 0
+        {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if attempt == 7
+            || !matches!(
+                error.raw_os_error().map(|code| code as u32),
+                Some(ERROR_ACCESS_DENIED | ERROR_LOCK_VIOLATION | ERROR_SHARING_VIOLATION)
+            )
+        {
+            return Err(error);
+        }
+        // A reader without delete sharing can briefly prevent atomic replacement.
+        // Keep both files intact while waiting; permanent errors still reach UI.
+        retry_wait(std::time::Duration::from_millis(5 * (attempt + 1)));
+    }
+    unreachable!()
+}
+
+fn preserve_settings_backup(backup: &Path, raw: &[u8]) -> Result<(), ClickerError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    let write = |file: &mut fs::File| file.write_all(raw).and_then(|_| file.sync_all());
+    if write_or_check_settings_backup(backup, raw, write)? {
+        return Ok(());
+    }
+    // Keep earlier originals and give each subsequent raw file a stable name.
+    let alternate = backup.with_extension(format!("{:x}.json", Sha256::digest(raw)));
+    if !write_or_check_settings_backup(&alternate, raw, write)? {
+        return Err(ClickerError::with_detail(
+            ErrorCode::SettingsBackup,
+            "The content-addressed settings backup contains different bytes.",
+        ));
+    }
+    Ok(())
+}
+
+/// Returns false only for an existing regular file containing different bytes.
+fn write_or_check_settings_backup(
+    backup: &Path,
+    raw: &[u8],
+    write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+) -> Result<bool, ClickerError> {
+    let backup_error = |error: std::io::Error| {
+        ClickerError::with_detail(ErrorCode::SettingsBackup, error.to_string())
+    };
+    let check_existing = |metadata: fs::Metadata| -> Result<bool, ClickerError> {
+        if !metadata.is_file() {
+            return Err(ClickerError::with_detail(
+                ErrorCode::SettingsBackup,
+                "The settings backup path is not a regular file.",
+            ));
+        }
+        let saved = fs::read(backup).map_err(backup_error)?;
+        Ok(saved == raw)
+    };
+    match fs::symlink_metadata(backup) {
+        Ok(metadata) => return check_existing(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(backup_error(error)),
+    }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(backup)
+    {
+        Ok(mut file) => {
+            let result = write(&mut file);
+            drop(file);
+            if let Err(error) = result {
+                let _ = fs::remove_file(backup);
+                return Err(backup_error(error));
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            check_existing(fs::symlink_metadata(backup).map_err(backup_error)?)
+        }
+        Err(error) => Err(backup_error(error)),
     }
 }
 
@@ -441,13 +513,308 @@ fn upgrade_millisecond_settings(value: &mut serde_json::Value) -> Result<(), Cli
             p.insert("interval_ticks".into(), ticks);
         }
     }
-    object.insert("version".into(), Value::from(3));
+    object.insert("version".into(), Value::from(4));
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const IMPORT_CASES: [(&str, &[u8], bool); 3] = [
+        (
+            "settings.python-backup.json",
+            br#"{"points":[[-150,42]],"interval":0.06,"repeat":500}"#,
+            true,
+        ),
+        (
+            "settings.v2-backup.json",
+            br#"{"version":2,"interval_ms":125,"points":[{"x":-150,"y":42}]}"#,
+            false,
+        ),
+        (
+            "settings.v3-backup.json",
+            br#"{"version":3,"interval_ticks":1250000,"points":[{"x":-150,"y":42}]}"#,
+            false,
+        ),
+    ];
+
+    fn expected_import_backup(backup: &Path, raw: &[u8]) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        backup.with_extension(format!("{:x}.json", Sha256::digest(raw)))
+    }
+
+    struct SettingsTestDirectory(PathBuf);
+    impl SettingsTestDirectory {
+        fn new(name: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "clicker-{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn settings_path(&self) -> PathBuf {
+            self.0.join("settings.json")
+        }
+    }
+    impl Drop for SettingsTestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn v3_migration_preserves_every_setting_and_backs_up_the_original_bytes() {
+        use crate::key_click::{InputMethod, MovementMode, PressBehavior};
+        let dir = SettingsTestDirectory::new("v3-upgrade");
+        let path = dir.settings_path();
+        let raw = br#"{
+            "version":3,"lang":"en","theme":"dark",
+            "points":[{"x":-150,"y":42,"interval_ticks":9},{"x":10,"y":20}],
+            "interval_ticks":9876543,"fast_interval_ticks":17,
+            "repeat":123,"delay_ms":1500,"button":"right","topmost":true,
+            "hotkeys":{"record_start":"ctrl+shift+r","record_stop":"ctrl+shift+d",
+                "click_start":"ctrl+shift+s","click_stop":"ctrl+shift+x"},
+            "per_point":true,"details_open":true,"mode":"area",
+            "area":{"left":-80,"top":-40,"right":800,"bottom":600},"area_step_px":42,
+            "key_clicks":{"enabled":true,
+                "last_target":{"executable":"C:/Games/example.exe","class":"GameWindow","title":"Example"},
+                "bindings":[{"key":87,"right":true,"position":{
+                    "game":{"executable":"C:/Games/example.exe","class":"GameWindow","title":"Example"},
+                    "x":320,"y":640,"width":1280,"height":900}},
+                    {"key":32,"position":null,"right":false}]}
+        }"#;
+        fs::write(&path, raw).unwrap();
+        let (settings, python_migrated) = Settings::load(&path).unwrap();
+        assert!(!python_migrated);
+        assert_eq!(settings.version, 4);
+        assert_eq!(settings.interval_ticks, 9876543);
+        assert_eq!(settings.fast_interval_ticks, 17);
+        assert_eq!(settings.interval_for(0), 9);
+        assert_eq!(settings.interval_for(1), 9876543);
+        assert_eq!(settings.hotkeys["click_stop"], "ctrl+shift+x");
+        assert_eq!(settings.key_clicks.input_method, InputMethod::Mouse);
+        assert_eq!(settings.key_clicks.movement_mode, MovementMode::Buttons);
+        assert!(settings.key_clicks.enabled);
+        assert!(settings.key_clicks.bindings[0].right);
+        assert_eq!(
+            settings.key_clicks.bindings[0].behavior,
+            PressBehavior::Click
+        );
+        assert_eq!(settings.key_clicks.bindings[0].label, "");
+        assert_eq!(settings.key_clicks.bindings[1].position, None);
+        let mut expected: Settings = serde_json::from_slice(raw).unwrap();
+        expected.version = 4;
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        let backup = dir.0.join("settings.v3-backup.json");
+        assert_eq!(fs::read(&backup).unwrap(), raw);
+        assert_eq!(fs::read(&path).unwrap(), raw);
+        assert!(!dir.0.join("settings.python-backup.json").exists());
+        assert!(!dir.0.join("settings.v2-backup.json").exists());
+        let (_, python_migrated) = Settings::load(&path).unwrap();
+        assert!(!python_migrated);
+        assert_eq!(fs::read(&backup).unwrap(), raw);
+        settings.save(&path).unwrap();
+        let (loaded, python_migrated) = Settings::load(&path).unwrap();
+        assert!(!python_migrated);
+        assert_eq!(loaded.version, 4);
+        assert_eq!(loaded.key_clicks, settings.key_clicks);
+        assert_eq!(loaded.interval_ticks, 9876543);
+        assert_eq!(fs::read(&backup).unwrap(), raw);
+    }
+
+    #[test]
+    fn reimports_preserve_both_originals_and_reuse_the_same_backup_for_the_same_raw() {
+        for (filename, raw, python_import) in IMPORT_CASES {
+            let dir = SettingsTestDirectory::new("backup-reimport");
+            let path = dir.settings_path();
+            let backup = dir.0.join(filename);
+            let alternate = expected_import_backup(&backup, raw);
+            let mut earlier = raw.to_vec();
+            earlier.push(b'\n');
+            fs::write(&path, raw).unwrap();
+            fs::write(&backup, &earlier).unwrap();
+            let (loaded, migrated) = Settings::load(&path).unwrap();
+            assert_eq!(migrated, python_import);
+            assert_eq!(loaded.version, 4);
+            assert_eq!(loaded.points[0].x, -150);
+            assert_eq!(fs::read(&backup).unwrap(), earlier);
+            assert_eq!(fs::read(&alternate).unwrap(), raw);
+            assert_eq!(fs::read(&path).unwrap(), raw);
+            let saved_permissions = fs::metadata(&alternate).unwrap().permissions();
+            let mut readonly = saved_permissions.clone();
+            readonly.set_readonly(true);
+            fs::set_permissions(&alternate, readonly).unwrap();
+            let retry = Settings::load(&path);
+            fs::set_permissions(&alternate, saved_permissions).unwrap();
+            assert_eq!(retry.unwrap().1, python_import);
+            assert_eq!(Settings::load(&path).unwrap().1, python_import);
+            assert_eq!(fs::read(&backup).unwrap(), earlier);
+            assert_eq!(fs::read(&alternate).unwrap(), raw);
+            assert_eq!(fs::read(&path).unwrap(), raw);
+            assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 3);
+        }
+    }
+
+    #[test]
+    fn invalid_backup_paths_and_corrupt_named_backups_leave_all_originals_untouched() {
+        for (filename, raw, _) in IMPORT_CASES {
+            let dir = SettingsTestDirectory::new("backup-invalid");
+            let path = dir.settings_path();
+            let backup = dir.0.join(filename);
+            let alternate = expected_import_backup(&backup, raw);
+            fs::write(&path, raw).unwrap();
+            fs::create_dir(&backup).unwrap();
+            assert_eq!(
+                Settings::load(&path).unwrap_err().code,
+                ErrorCode::SettingsBackup
+            );
+            assert_eq!(fs::read(&path).unwrap(), raw);
+            assert!(backup.is_dir());
+            assert!(!alternate.exists());
+            fs::remove_dir(&backup).unwrap();
+            let mut earlier = raw.to_vec();
+            earlier.push(b'\n');
+            fs::write(&backup, &earlier).unwrap();
+            fs::create_dir(&alternate).unwrap();
+            assert_eq!(
+                Settings::load(&path).unwrap_err().code,
+                ErrorCode::SettingsBackup
+            );
+            assert!(alternate.is_dir());
+            assert_eq!(fs::read(&backup).unwrap(), earlier);
+            assert_eq!(fs::read(&path).unwrap(), raw);
+            fs::remove_dir(&alternate).unwrap();
+            let corrupt = &raw[..raw.len() / 2];
+            fs::write(&alternate, corrupt).unwrap();
+            assert_eq!(
+                Settings::load(&path).unwrap_err().code,
+                ErrorCode::SettingsBackup
+            );
+            assert_eq!(fs::read(&alternate).unwrap(), corrupt);
+            assert_eq!(fs::read(&backup).unwrap(), earlier);
+            assert_eq!(fs::read(&path).unwrap(), raw);
+            assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 3);
+        }
+    }
+
+    #[test]
+    fn backup_creation_and_partial_write_failures_keep_the_source_and_allow_a_clean_retry() {
+        use std::io::Write;
+        for (filename, raw, python_import) in IMPORT_CASES {
+            let dir = SettingsTestDirectory::new("backup-write-failure");
+            let path = dir.settings_path();
+            let missing_parent = dir.0.join("missing");
+            fs::write(&path, raw).unwrap();
+            assert_eq!(
+                preserve_settings_backup(&missing_parent.join(filename), raw)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::SettingsBackup
+            );
+            assert!(!missing_parent.exists());
+            assert_eq!(fs::read(&path).unwrap(), raw);
+            let backup = dir.0.join(filename);
+            let alternate = expected_import_backup(&backup, raw);
+            let mut earlier = raw.to_vec();
+            earlier.push(b'\n');
+            fs::write(&backup, &earlier).unwrap();
+            let result = write_or_check_settings_backup(&alternate, raw, |file| {
+                file.write_all(&raw[..raw.len() / 2])?;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "Write failed",
+                ))
+            });
+            assert_eq!(result.unwrap_err().code, ErrorCode::SettingsBackup);
+            assert!(!alternate.exists());
+            assert_eq!(fs::read(&backup).unwrap(), earlier);
+            assert_eq!(fs::read(&path).unwrap(), raw);
+            assert_eq!(Settings::load(&path).unwrap().1, python_import);
+            assert_eq!(fs::read(&backup).unwrap(), earlier);
+            assert_eq!(fs::read(&alternate).unwrap(), raw);
+            assert_eq!(fs::read(&path).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn invalid_v3_controls_do_not_overwrite_settings_or_create_a_backup() {
+        let dir = SettingsTestDirectory::new("v3-invalid");
+        let path = dir.settings_path();
+        for raw in [
+            r#"{"version":3,"key_clicks":{"bindings":[{"key":87},{"key":87}]}}"#,
+            r#"{"version":3,"key_clicks":{"stick":{"radius_px":3}}}"#,
+            r#"{"version":3,"key_clicks":{"selected_profile":999}}"#,
+            r#"{"version":3,"interval_ticks":0}"#,
+        ] {
+            fs::write(&path, raw).unwrap();
+            assert!(Settings::load(&path).is_err(), "{raw}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+            assert!(!dir.0.join("settings.v3-backup.json").exists());
+        }
+    }
+
+    #[test]
+    fn profiles_and_an_unnamed_incomplete_editor_round_trip_in_v4() {
+        use crate::key_click::{InputMethod, KeyBinding, MovementMode, PressBehavior};
+        let dir = SettingsTestDirectory::new("v4-profile-save");
+        let path = dir.settings_path();
+        let mut settings = Settings {
+            interval_ticks: 3,
+            ..Settings::default()
+        };
+        settings.key_clicks.bindings.push(KeyBinding {
+            key: Some(b'W' as u32),
+            right: true,
+            ..KeyBinding::default()
+        });
+        let old = settings.key_clicks.save_profile("Existing").unwrap();
+        settings.key_clicks.new_profile().unwrap();
+        settings.key_clicks.bindings.push(KeyBinding {
+            key: Some(0x10),
+            label: "Run".into(),
+            behavior: PressBehavior::Hold,
+            ..KeyBinding::default()
+        });
+        settings.key_clicks.movement_mode = MovementMode::Stick;
+        settings.key_clicks.stick.radius_px = 48;
+        settings.key_clicks.sync_selected_profile().unwrap();
+        assert_eq!(settings.key_clicks.selected_profile, None);
+        assert!(!settings.key_clicks.has_configured_action());
+        settings.save(&path).unwrap();
+        let (mut loaded, migrated) = Settings::load(&path).unwrap();
+        assert!(!migrated);
+        assert_eq!(loaded.key_clicks, settings.key_clicks);
+        assert_eq!(loaded.interval_ticks, 3);
+        assert_eq!(loaded.key_clicks.input_method, InputMethod::Touch);
+        loaded.key_clicks.select_profile(old).unwrap();
+        assert_eq!(loaded.key_clicks.profiles.len(), 2);
+        assert_eq!(loaded.key_clicks.bindings[0].behavior, PressBehavior::Click);
+        assert!(loaded.key_clicks.bindings[0].right);
+        let draft = loaded
+            .key_clicks
+            .profiles
+            .iter()
+            .find(|profile| profile.id != old)
+            .unwrap()
+            .id;
+        loaded.key_clicks.select_profile(draft).unwrap();
+        assert_eq!(loaded.key_clicks.bindings[0].key, Some(0x10));
+        assert_eq!(loaded.key_clicks.bindings[0].label, "Run");
+        assert_eq!(loaded.key_clicks.stick.center, None);
+        assert_eq!(loaded.key_clicks.stick.radius_px, 48);
+        assert!(!loaded.key_clicks.has_configured_action());
+        assert!(!dir.0.join("settings.v3-backup.json").exists());
+    }
+
     #[test]
     fn nanosecond_precision_and_millisecond_migration_preserve_exact_values() {
         let dir = std::env::temp_dir().join(format!("clicker-tick-upgrade-{}", std::process::id()));
@@ -455,8 +822,9 @@ mod tests {
         let path = dir.join("settings.json");
         let raw=br#"{"version":2,"interval_ms":501,"fast_interval_ms":1,"points":[{"x":5,"y":-6,"interval_ms":7}],"repeat":500,"mode":"drag"}"#;
         fs::write(&path, raw).unwrap();
-        let (mut s, _) = Settings::load(&path).unwrap();
-        assert_eq!(s.version, 3);
+        let (mut s, migrated) = Settings::load(&path).unwrap();
+        assert!(!migrated);
+        assert_eq!(s.version, 4);
         assert_eq!(s.interval_ticks, 5_010_000);
         assert_eq!(s.fast_interval_ticks, 10_000);
         assert_eq!(s.points[0].interval_ticks, Some(70_000));
@@ -671,5 +1039,66 @@ mod tests {
                 .exists()
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_settings_replacement_waits_for_a_reader_without_delete_sharing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        let dir = SettingsTestDirectory::new("replace-reader");
+        let path = dir.0.join("settings.json");
+        let temp = dir.0.join("ready.tmp");
+        fs::write(&path, b"original").unwrap();
+        fs::write(&temp, b"replacement").unwrap();
+        let mut reader = Some(
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(&path)
+                .unwrap(),
+        );
+        let mut waits = 0;
+        replace_settings_file(&temp, &path, |_| {
+            waits += 1;
+            assert_eq!(fs::read(&path).unwrap(), b"original");
+            assert_eq!(fs::read(&temp).unwrap(), b"replacement");
+            drop(reader.take());
+        })
+        .unwrap();
+        assert!(waits > 0 && waits <= 7);
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        assert!(!temp.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_permanently_locked_settings_file_preserves_original_and_reports_failure() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        let dir = SettingsTestDirectory::new("replace-locked");
+        let path = dir.0.join("settings.json");
+        Settings::default().save(&path).unwrap();
+        let original = fs::read(&path).unwrap();
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
+        let changed = Settings {
+            repeat: 17,
+            ..Settings::default()
+        };
+        let error = changed.save(&path).unwrap_err();
+        assert_eq!(error.code, ErrorCode::SettingsWrite);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(
+            !path
+                .with_extension(format!("{}.tmp", std::process::id()))
+                .exists()
+        );
+        drop(reader);
+        changed.save(&path).unwrap();
+        assert_eq!(Settings::load(&path).unwrap().0.repeat, 17);
     }
 }
