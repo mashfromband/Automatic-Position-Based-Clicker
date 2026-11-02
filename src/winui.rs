@@ -1,6 +1,7 @@
 use multi_point_clicker::{
     engine::{Progress, Runner},
     error::{ClickerError, ErrorCode},
+    input_language::InputLanguageGuard,
     key_click::{
         self, KeyBinding,
         native::{Controller as KeyController, Target as KeyTarget},
@@ -3028,6 +3029,10 @@ pub fn run() -> i32 {
                 }
                 .into();
         }
+        let (input_language_guard, input_language_error) = match InputLanguageGuard::register() {
+            Ok(guard) => (Some(guard), None),
+            Err(error) => (None, Some(error)),
+        };
         let cursor = LoadCursorW(null_mut(), IDC_ARROW);
         let class = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
@@ -3075,6 +3080,7 @@ pub fn run() -> i32 {
             } else {
                 "Cannot create the application window."
             });
+            drop(input_language_guard);
             CloseHandle(mutex);
             return 1;
         }
@@ -3137,6 +3143,17 @@ pub fn run() -> i32 {
         if let Err(e) = app.register_hotkeys() {
             app.message = e;
         }
+        if let Some(error) = input_language_error {
+            let warning = app.t(
+                "Alt+ShiftによるWindowsの入力言語切り替えを抑止できません。",
+                "Cannot suppress Windows input-language switching with Alt+Shift.",
+            );
+            let message = format!("{warning} ({error})");
+            if !app.message.is_empty() {
+                app.message.push('\n');
+            }
+            app.message.push_str(&message);
+        }
         APP.with(|cell| *cell.borrow_mut() = Some(app));
         SendMessageW(hwnd, APP_INIT, 0, 0);
         ShowWindow(hwnd, SW_SHOW);
@@ -3151,6 +3168,14 @@ pub fn run() -> i32 {
                 if result <= 0 {
                     exit_code = if result == 0 { msg.wParam as i32 } else { 1 };
                     break;
+                }
+                if msg.hwnd.is_null()
+                    && msg.message == WM_HOTKEY
+                    && input_language_guard
+                        .as_ref()
+                        .is_some_and(|guard| guard.owns_hotkey(msg.wParam))
+                {
+                    continue;
                 }
                 if IsDialogMessageW(hwnd, &msg) == 0 {
                     TranslateMessage(&msg);
@@ -3180,6 +3205,7 @@ pub fn run() -> i32 {
         if IsWindow(hwnd) != 0 {
             DestroyWindow(hwnd);
         }
+        drop(input_language_guard);
         CloseHandle(mutex);
         exit_code
     }
@@ -3805,6 +3831,7 @@ mod tests {
     }
     #[test]
     fn keyboard_bindings_round_trip_and_cover_no_numpad() {
+        assert_eq!(parse_hotkey("alt+vk32"), Some((MOD_ALT, VK_SPACE as u32)));
         for combo in [
             "ctrl+alt+r",
             "ctrl+shift+f12",
